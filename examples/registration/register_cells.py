@@ -5,6 +5,7 @@ Example of registering two images of cells using exhaustive warp search.
 
 Run:
     uv run examples/registration/register_cells.py
+    uv run python examples/registration/register_cells.py --selection 13
 """
 
 
@@ -41,16 +42,23 @@ from batchmatch.warp import WarpPipelineConfig, build_warp_pipeline
 
 import argparse
 
-def _parse_image_from_selection(selection: int) -> tuple[Path, Path]:
+def _parse_image_from_selection(selection: int, tile: str, xenIN: str) -> tuple[Path, Path]:
     base_path = Path("cells") / f"selection_{selection}"
     moving_path = base_path / "fish_dapi.jpg"
     sel = f"sel{selection}"
-    reference_path = base_path / f"xenium_region_2-{sel}-highres_wide.png"
+    # reference_path = base_path / f"xenium_region_2-{sel}-highres_wide.png"
+    matches = list((base_path / f"../../../xeniumtiles/{xenIN}/").glob(f"tile{tile}*.png"))
+    # search_dir = (base_path / "../../../xeniumtiles/tiles_o20k_png_s4/").resolve()
+    # print("Searching in:", search_dir)
+    # print("Exists:", search_dir.exists())
+    reference_path = matches[0]
     return moving_path, reference_path
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--selection", type=int, default=7, help="Cell selection number.")
+    parser.add_argument("--xenIN", type=str, default="", help="Xenium input folder.")
+    parser.add_argument("--tile", type=str, default=7, help="Tile selection number.")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -88,7 +96,8 @@ def _str_to_translation_config(metric: str):
 
 def main() -> None:
     args = _parse_args()
-    moving_path, reference_path = _parse_image_from_selection(args.selection)
+    print(f"_____{args}_____")
+    moving_path, reference_path = _parse_image_from_selection(args.selection,args.tile,args.xenIN)
     img = ImageIO(grayscale=True).load(reference_path)
     reference = build_image_td(img)
     reference_base = reference.clone()
@@ -178,9 +187,9 @@ def main() -> None:
 
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = args.output_prefix
+    prefix = "".join([args.output_prefix,f"_sel{args.selection}"])
 
-    out_dir = out_dir / prefix / f"metric_{args.metric}_searchdim_{args.search_dim}"
+    out_dir = out_dir / prefix / f"metric_{args.metric}_searchdim_{args.search_dim}_{args.xenIN}_{args.tile}"
 
     moving_save = original_mov.clone()
     reference_save = reference_out.clone()
