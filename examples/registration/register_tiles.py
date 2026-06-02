@@ -96,8 +96,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--downsample",
         type=int,
-        default=4,
-        help="Integer downsample applied when reading each tile (lower-resolution search).",
+        default=1,
+        help=(
+            "Integer downsample applied when reading each tile. Default 1 "
+            "(full resolution per tile). Set >1 for a faster low-resolution search."
+        ),
     )
     parser.add_argument("--search-dim", type=int, default=512)
     parser.add_argument("--pad-scale", type=float, default=2.0)

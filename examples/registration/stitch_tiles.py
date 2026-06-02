@@ -11,9 +11,15 @@ weighted by a Gaussian of the distance from the output pixel to the
 tile's reference-space center, so neighbouring tiles blend seamlessly
 instead of showing seams.
 
-Because the wide-view goal is low-resolution registration, the output is
-produced at a configurable downsample.  The output canvas is iterated in
-tiles so memory stays bounded regardless of canvas size.
+The stitched output is produced at full resolution by default
+(``--output-downsample 1``); pass a larger downsample for a quick
+low-resolution preview.  The output canvas is iterated in tiles so the
+sampling grid is never materialized for the whole canvas and memory
+stays bounded regardless of canvas size.
+
+Two previews are written: a red/green two-color overlay
+(reference=green, moving=red, overlap=yellow) that is easy to read at any
+scale, plus the classic gray+red alpha overlay and a checkerboard.
 
 Run:
     uv run python examples/registration/stitch_tiles.py \
@@ -63,14 +69,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-downsample",
         type=int,
-        default=8,
-        help="Downsample of the stitched output canvas (reference full-res / this).",
+        default=1,
+        help=(
+            "Downsample of the stitched output canvas (reference full-res / this). "
+            "Default 1 (full resolution). Set >1 for a smaller, faster preview product."
+        ),
     )
     parser.add_argument(
         "--moving-downsample",
         type=int,
-        default=8,
-        help="Downsample at which the moving image is loaded for resampling.",
+        default=1,
+        help=(
+            "Downsample at which the moving image is loaded for resampling. "
+            "Default 1 (full resolution). Increase if the moving image does not "
+            "fit in memory."
+        ),
     )
     parser.add_argument(
         "--blend-sigma",
@@ -124,32 +137,34 @@ def _parse_channel(value: str | None) -> int | str | None:
         return value
 
 
-def _build_field(
+def _warp_stitched(
+    mov_tensor: torch.Tensor,       # (B, C, mov_h, mov_w) loaded at ds_mov
     *,
-    centers_ref: np.ndarray,       # (T, 2) tile centers in ref-full pixels (x, y)
+    centers_ref: np.ndarray,        # (T, 2) tile centers in ref-full pixels (x, y)
     mats_mov_from_ref: np.ndarray,  # (T, 3, 3)
     out_h: int,
     out_w: int,
     ds_out: int,
     ds_mov: int,
-    mov_hw: tuple[int, int],
     sigma: float,
     output_tile: int,
-    device: torch.device,
 ) -> torch.Tensor:
-    """Return a (out_h, out_w, 2) grid_sample grid in normalized coords.
+    """Resample ``mov_tensor`` through the blended piecewise-affine field.
 
     For each output pixel the moving sample coordinate is the
     Gaussian-distance-weighted blend of every tile's affine evaluated at
-    that pixel's reference-full position.
+    that pixel's reference-full position. The output is produced one
+    ``output_tile`` block at a time so the sampling grid is never
+    materialized for the whole canvas (bounded memory).
     """
-    T = centers_ref.shape[0]
-    mov_h, mov_w = mov_hw
+    device = mov_tensor.device
+    B, C = int(mov_tensor.shape[0]), int(mov_tensor.shape[1])
+    mov_h, mov_w = int(mov_tensor.shape[-2]), int(mov_tensor.shape[-1])
     centers = torch.as_tensor(centers_ref, dtype=torch.float32, device=device)  # (T, 2)
     mats = torch.as_tensor(mats_mov_from_ref, dtype=torch.float32, device=device)  # (T,3,3)
     inv_two_sigma_sq = 1.0 / (2.0 * float(sigma) ** 2)
 
-    grid = torch.empty((out_h, out_w, 2), dtype=torch.float32, device=device)
+    out = torch.zeros((B, C, out_h, out_w), dtype=torch.float32, device=device)
 
     for y0 in range(0, out_h, output_tile):
         y1 = min(out_h, y0 + output_tile)
@@ -158,10 +173,10 @@ def _build_field(
             ys = torch.arange(y0, y1, device=device, dtype=torch.float32)
             xs = torch.arange(x0, x1, device=device, dtype=torch.float32)
             gy, gx = torch.meshgrid(ys, xs, indexing="ij")  # (h, w)
+            h, w = gy.shape
             # reference-full pixel coordinates of these output pixels
             rx = gx * ds_out
             ry = gy * ds_out
-            h, w = gy.shape
             ref_pts = torch.stack(
                 [rx, ry, torch.ones_like(rx)], dim=-1
             ).reshape(-1, 3)  # (P, 3)
@@ -178,15 +193,51 @@ def _build_field(
             mov_xy = mov_pts[..., :2]  # (T, P, 2), mov-full pixels
             blended = (wts.t().unsqueeze(-1) * mov_xy).sum(dim=0)  # (P, 2)
 
-            # mov-full -> mov-tensor pixels (loaded at ds_mov)
+            # mov-full -> mov-tensor pixels (loaded at ds_mov), then normalize
             mx = blended[:, 0] / ds_mov
             my = blended[:, 1] / ds_mov
             x_norm = (2.0 * mx + 1.0) / float(mov_w) - 1.0
             y_norm = (2.0 * my + 1.0) / float(mov_h) - 1.0
-            tile_grid = torch.stack([x_norm, y_norm], dim=-1).reshape(h, w, 2)
-            grid[y0:y1, x0:x1] = tile_grid
+            tile_grid = (
+                torch.stack([x_norm, y_norm], dim=-1).reshape(1, h, w, 2).expand(B, -1, -1, -1)
+            )
+            out[..., y0:y1, x0:x1] = torch.nn.functional.grid_sample(
+                mov_tensor,
+                tile_grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
 
-    return grid
+    return out
+
+
+def _two_color_overlay(reference: torch.Tensor, moving: torch.Tensor) -> np.ndarray:
+    """Build an (H, W, 3) red/green overlay: reference=green, moving=red.
+
+    Each image is reduced to a single channel, min-max normalized, and
+    placed in its own RGB channel so overlap reads as yellow. This is far
+    easier to read than the gray+red alpha blend at any resolution.
+    """
+
+    def _prep(t: torch.Tensor) -> torch.Tensor:
+        x = t.detach().to(torch.float32)
+        while x.dim() > 2:  # collapse batch/channel by taking channel-mean
+            x = x.mean(dim=0)
+        lo, hi = float(x.min()), float(x.max())
+        if hi > lo:
+            x = (x - lo) / (hi - lo)
+        else:
+            x = torch.zeros_like(x)
+        return x
+
+    ref = _prep(reference)
+    mov = _prep(moving)
+    h = min(ref.shape[0], mov.shape[0])
+    w = min(ref.shape[1], mov.shape[1])
+    ref, mov = ref[:h, :w], mov[:h, :w]
+    rgb = torch.stack([mov, ref, torch.zeros_like(ref)], dim=-1)  # R=mov, G=ref
+    return (rgb.clamp(0.0, 1.0) * 255.0).to(torch.uint8).cpu().numpy()
 
 
 def main() -> None:
@@ -238,7 +289,6 @@ def main() -> None:
     out_h = max(1, ref_h // args.output_downsample)
     out_w = max(1, ref_w // args.output_downsample)
 
-    device = torch.device("cpu")
     print(f"reference: {ref_path}  full={ref_source.base_shape_hw}")
     print(f"moving:    {mov_path}  full={mov_source.base_shape_hw}")
     print(f"usable tiles: {len(tiles)}  center spacing={spacing:.1f}px  sigma={sigma:.1f}px")
@@ -248,27 +298,17 @@ def main() -> None:
         mov_path, channels=mov_channel, downsample=args.moving_downsample, grayscale=False
     )
     mov_tensor = moving.detail.image.to(torch.float32)
-    mov_h, mov_w = int(mov_tensor.shape[-2]), int(mov_tensor.shape[-1])
 
-    grid = _build_field(
+    warped = _warp_stitched(
+        mov_tensor,
         centers_ref=centers_arr,
         mats_mov_from_ref=mats_arr,
         out_h=out_h,
         out_w=out_w,
         ds_out=args.output_downsample,
         ds_mov=args.moving_downsample,
-        mov_hw=(mov_h, mov_w),
         sigma=sigma,
         output_tile=args.output_tile,
-        device=device,
-    )
-
-    warped = torch.nn.functional.grid_sample(
-        mov_tensor,
-        grid.unsqueeze(0).expand(mov_tensor.shape[0], -1, -1, -1),
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=False,
     )
 
     out_path = args.output_dir / "stitched_registered.ome.tif"
@@ -298,6 +338,8 @@ def main() -> None:
     print(f"stitched warped moving: {out_path}")
 
     if not args.no_preview:
+        import matplotlib.image as mpimg
+
         reference = load_image(
             ref_path, channels=ref_channel, downsample=args.output_downsample, grayscale=False
         )
@@ -308,6 +350,11 @@ def main() -> None:
         ref_crop = ref_detail.image[..., :rh, :rw]
         warped_crop = warped[..., :rh, :rw]
         from batchmatch.base.detail import build_image_td
+
+        # Two-color overlay: reference=green, moving=red, overlap=yellow.
+        two_color = _two_color_overlay(ref_crop, warped_crop)
+        two_color_path = args.output_dir / "preview_two_color.png"
+        mpimg.imsave(str(two_color_path), two_color)
 
         show_comparison(
             build_image_td(ref_crop),
@@ -334,7 +381,7 @@ def main() -> None:
                 save_path=str(args.output_dir / "preview_checkerboard.png"),
             ),
         )
-        print(f"previews: {args.output_dir / 'preview_overlay.png'}")
+        print(f"previews: {two_color_path} (two-color), {args.output_dir / 'preview_overlay.png'}")
 
     field_manifest = {
         "manifest": str(args.manifest.resolve()),
