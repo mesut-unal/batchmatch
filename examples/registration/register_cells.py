@@ -65,6 +65,18 @@ def _parse_image_from_selection(selection: int) -> tuple[Path, Path]:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--selection", type=int, default=7)
+    parser.add_argument(
+        "--moving",
+        type=Path,
+        default=None,
+        help="Moving image path (e.g. FISH jpg). Overrides --selection when given.",
+    )
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        default=None,
+        help="Reference image path (e.g. a Xenium tile png). Overrides --selection when given.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs") / "register_cells")
     parser.add_argument("--search-dim", type=int, default=1024)
     parser.add_argument("--metric", choices=("ncc", "ngf", "gpc"), default="gpc")
@@ -149,7 +161,14 @@ def export_stacked_registered_tiff(
 
 def main() -> None:
     args = _parse_args()
-    moving_path, reference_path = _parse_image_from_selection(args.selection)
+    if args.moving is not None or args.reference is not None:
+        if args.moving is None or args.reference is None:
+            raise ValueError("Provide both --moving and --reference, or neither.")
+        moving_path, reference_path = args.moving, args.reference
+    else:
+        moving_path, reference_path = _parse_image_from_selection(args.selection)
+    print(f"moving:    {moving_path}")
+    print(f"reference: {reference_path}")
 
     moving = load_image(moving_path, grayscale=True)
     reference = load_image(reference_path, grayscale=True)
