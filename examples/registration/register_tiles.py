@@ -1,21 +1,30 @@
-"""Tile-wise low-resolution registration of two calibrated TIFFs.
+"""Tile-wise registration of two calibrated TIFFs via coarse-then-tile.
 
-Co-tiles a reference and moving image by *physical* world coordinates
-(using each TIFF's ``origin_xy`` and ``pixel_size_xy``) so that
-corresponding tiles cover the same region of space, then runs the
-exhaustive warp search independently on each tile pair at a reduced
-resolution.
+A coarse whole-image alignment is computed first (or loaded from a prior
+register_tiff manifest with ``--init-manifest``). The reference image is
+then tiled in its own pixel space, and for each reference tile the coarse
+transform predicts the corresponding moving region, which is loaded and
+refined with an independent exhaustive warp search. Each tile yields a
+local affine transform expressed directly in full-resolution source
+coordinates.
 
-This is the "register tiles at lower resolution" step that whole-image
-registration cannot resolve on wide-view Xenium vs. FISH data: each tile
-gets its own local affine transform, expressed directly in
-full-resolution source pixel coordinates.
+This coarse-then-tile correspondence is required for cross-instrument
+data (e.g. Olympus FISH vs. Xenium morphology): the two images do NOT
+share a world coordinate frame, so tiling by absolute physical
+coordinates would pair unrelated regions. The coarse alignment puts them
+into correspondence first.
+
+For multimodal pairs use a gradient-based metric (``--metric ngf`` or
+``gngf``); intensity NCC is unreliable across modalities.
 
 Run:
-    uv run python examples/registration/register_tiles.py
     uv run python examples/registration/register_tiles.py \
         --reference ref.ome.tif --moving mov.ome.tif \
-        --tile-size 2000 2000 --downsample 4
+        --reference-channel DAPI --moving-channel 0 \
+        --tile-size 2000 2000 --metric ngf
+    # reuse an existing coarse alignment:
+    uv run python examples/registration/register_tiles.py ... \
+        --init-manifest outputs/register_tiff/registration.json
 """
 
 from __future__ import annotations
@@ -102,6 +111,35 @@ def _parse_args() -> argparse.Namespace:
             "(full resolution per tile). Set >1 for a faster low-resolution search."
         ),
     )
+    parser.add_argument(
+        "--coarse-downsample",
+        type=int,
+        default=16,
+        help=(
+            "Downsample for the coarse whole-image alignment that establishes "
+            "tile correspondence. Larger = faster/coarser. Ignored if "
+            "--init-manifest is given."
+        ),
+    )
+    parser.add_argument(
+        "--init-manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a register_tiff registration.json. Its "
+            "ref_full_from_mov_full matrix is used as the coarse alignment "
+            "instead of computing one internally."
+        ),
+    )
+    parser.add_argument(
+        "--moving-margin",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of the tile size by which each tile's predicted moving "
+            "region is expanded on every side, to absorb coarse-alignment error."
+        ),
+    )
     parser.add_argument("--search-dim", type=int, default=512)
     parser.add_argument("--pad-scale", type=float, default=2.0)
     parser.add_argument(
@@ -174,79 +212,88 @@ def _build_search_params(args: argparse.Namespace) -> SearchParams:
     )
 
 
-def _world_bbox(source: SourceInfo) -> tuple[float, float, float, float]:
-    """Physical bounding box (x0, y0, x1, y1) of a calibrated source."""
-    if source.pixel_size_xy is None:
-        raise ValueError(
-            f"{source.source_path} lacks pixel_size_xy; physical co-tiling requires "
-            "spatial calibration. Re-tile with --tile-size-pixels or supply OME-TIFF metadata."
-        )
-    px_w, px_h = source.pixel_size_xy
-    ox, oy = source.origin_xy or (0.0, 0.0)
-    h, w = source.base_shape_hw
-    return (ox, oy, ox + w * px_w, oy + h * px_h)
+def _reference_tile_grid(
+    ref: SourceInfo,
+    tile_h_phys: float | None,
+    tile_w_phys: float | None,
+    overlap_phys: float,
+) -> list[RegionYXHW]:
+    """Tile the reference image in its own pixel space.
+
+    Tile sizes are given in physical units (matching ``ref.pixel_size_xy``)
+    and converted to reference pixels. When no tile size is supplied, the
+    reference is split into a 2x2 grid.
+    """
+    ref_h, ref_w = ref.base_shape_hw
+    if tile_h_phys is None or tile_w_phys is None or ref.pixel_size_xy is None:
+        tile_h = max(1, ref_h // 2)
+        tile_w = max(1, ref_w // 2)
+        overlap_h = overlap_w = 0
+    else:
+        px_w, px_h = ref.pixel_size_xy
+        tile_h = max(1, round(tile_h_phys / px_h))
+        tile_w = max(1, round(tile_w_phys / px_w))
+        overlap_h = max(0, round(overlap_phys / px_h))
+        overlap_w = max(0, round(overlap_phys / px_w))
+
+    step_h = max(1, tile_h - overlap_h)
+    step_w = max(1, tile_w - overlap_w)
+
+    tiles: list[RegionYXHW] = []
+    y = 0
+    while y < ref_h:
+        h = min(tile_h, ref_h - y)
+        x = 0
+        while x < ref_w:
+            w = min(tile_w, ref_w - x)
+            tiles.append(RegionYXHW(y=y, x=x, h=h, w=w))
+            x += step_w
+        y += step_h
+    return tiles
 
 
-def _world_to_region(
-    source: SourceInfo,
-    wx0: float,
-    wy0: float,
-    wx1: float,
-    wy1: float,
+def _apply_affine(pts_xy: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Apply a 3x3 affine to (N, 2) points in (x, y)."""
+    homog = np.concatenate([pts_xy, np.ones((pts_xy.shape[0], 1))], axis=1)
+    out = homog @ np.asarray(matrix, dtype=np.float64).T
+    return out[:, :2]
+
+
+def _predict_moving_region(
+    ref_region: RegionYXHW,
+    matrix_mov_from_ref: np.ndarray,
+    mov: SourceInfo,
+    margin: float,
 ) -> RegionYXHW | None:
-    """Convert a physical box to a pixel RegionYXHW clipped to the image."""
-    px_w, px_h = source.pixel_size_xy  # type: ignore[misc]
-    ox, oy = source.origin_xy or (0.0, 0.0)
-    h, w = source.base_shape_hw
+    """Map a reference tile through the coarse transform to a moving region.
 
-    x_px = (wx0 - ox) / px_w
-    y_px = (wy0 - oy) / px_h
-    x2_px = (wx1 - ox) / px_w
-    y2_px = (wy1 - oy) / px_h
+    The reference tile's four corners are mapped to moving-full pixel
+    coordinates; their bounding box (expanded by ``margin`` of the tile
+    size on each side) is clipped to the moving image.
+    """
+    mov_h, mov_w = mov.base_shape_hw
+    corners = np.array(
+        [
+            [ref_region.x, ref_region.y],
+            [ref_region.x2, ref_region.y],
+            [ref_region.x, ref_region.y2],
+            [ref_region.x2, ref_region.y2],
+        ],
+        dtype=np.float64,
+    )
+    mov_pts = _apply_affine(corners, matrix_mov_from_ref)
+    mx0, my0 = mov_pts[:, 0].min(), mov_pts[:, 1].min()
+    mx1, my1 = mov_pts[:, 0].max(), mov_pts[:, 1].max()
+    pad_x = (mx1 - mx0) * margin
+    pad_y = (my1 - my0) * margin
 
-    x = max(0, int(np.floor(min(x_px, x2_px))))
-    y = max(0, int(np.floor(min(y_px, y2_px))))
-    x2 = min(w, int(np.ceil(max(x_px, x2_px))))
-    y2 = min(h, int(np.ceil(max(y_px, y2_px))))
+    x = max(0, int(np.floor(mx0 - pad_x)))
+    y = max(0, int(np.floor(my0 - pad_y)))
+    x2 = min(mov_w, int(np.ceil(mx1 + pad_x)))
+    y2 = min(mov_h, int(np.ceil(my1 + pad_y)))
     if x2 - x < 1 or y2 - y < 1:
         return None
     return RegionYXHW(y=y, x=x, h=y2 - y, w=x2 - x)
-
-
-def _shared_tile_grid(
-    ref: SourceInfo,
-    mov: SourceInfo,
-    tile_h: float | None,
-    tile_w: float | None,
-    overlap: float,
-) -> list[tuple[float, float, float, float]]:
-    """Tile the intersection of the two physical bounding boxes."""
-    rx0, ry0, rx1, ry1 = _world_bbox(ref)
-    mx0, my0, mx1, my1 = _world_bbox(mov)
-    x0, y0 = max(rx0, mx0), max(ry0, my0)
-    x1, y1 = min(rx1, mx1), min(ry1, my1)
-    if x1 <= x0 or y1 <= y0:
-        raise ValueError(
-            "Reference and moving images do not overlap in physical space. "
-            f"ref bbox={(rx0, ry0, rx1, ry1)}, mov bbox={(mx0, my0, mx1, my1)}."
-        )
-
-    if tile_h is None or tile_w is None:
-        tile_h = (y1 - y0) / 2.0
-        tile_w = (x1 - x0) / 2.0
-
-    step_w = max(tile_w - overlap, tile_w * 1e-3)
-    step_h = max(tile_h - overlap, tile_h * 1e-3)
-
-    tiles: list[tuple[float, float, float, float]] = []
-    wy = y0
-    while wy < y1:
-        wx = x0
-        while wx < x1:
-            tiles.append((wx, wy, min(wx + tile_w, x1), min(wy + tile_h, y1)))
-            wx += step_w
-        wy += step_h
-    return tiles
 
 
 def _register_pair(
@@ -291,6 +338,53 @@ def _register_pair(
     return transform, ref_search_cpu, mov_search_cpu, result_cpu
 
 
+def _coarse_matrix_from_manifest(path: Path) -> np.ndarray:
+    """Read ref_full_from_mov_full from a register_tiff registration.json."""
+    data = json.loads(path.read_text())
+    try:
+        mat = data["transform"]["matrices"]["ref_full_from_mov_full"]
+    except (KeyError, TypeError) as exc:  # pragma: no cover - defensive
+        raise ValueError(
+            f"{path} does not look like a register_tiff manifest "
+            "(missing transform.matrices.ref_full_from_mov_full)."
+        ) from exc
+    return np.asarray(mat, dtype=np.float64)
+
+
+def _compute_coarse_matrix(
+    reference_path: Path,
+    moving_path: Path,
+    *,
+    ref_channel: int | str | None,
+    mov_channel: int | str | None,
+    coarse_downsample: int,
+    search_params: SearchParams,
+    config: ExhaustiveSearchConfig,
+    search_dim: int,
+    pad_scale: float,
+    device: torch.device,
+) -> np.ndarray:
+    """Run a whole-image low-res registration to get ref_full_from_mov_full."""
+    reference = load_image(
+        reference_path, channels=ref_channel, downsample=coarse_downsample, grayscale=False
+    )
+    moving = load_image(
+        moving_path, channels=mov_channel, downsample=coarse_downsample, grayscale=False
+    )
+    transform, _, _, result = _register_pair(
+        reference,
+        moving,
+        search_params=search_params,
+        config=config,
+        search_dim=search_dim,
+        pad_scale=pad_scale,
+        device=device,
+    )
+    score = float(result.translation_results.score[0].item())
+    print(f"coarse alignment score={score:.4f} (downsample={coarse_downsample})")
+    return transform.matrix_ref_full_from_mov_full
+
+
 def main() -> None:
     args = _parse_args()
     os.environ.setdefault("MPLBACKEND", "Agg")
@@ -308,19 +402,9 @@ def main() -> None:
     with open_image(moving_path) as src:
         mov_source = src.source
 
-    if (ref_source.unit or "") != (mov_source.unit or ""):
-        raise ValueError(
-            f"Physical units differ: ref={ref_source.unit!r}, mov={mov_source.unit!r}."
-        )
-
-    tile_h = args.tile_size[0] if args.tile_size else None
-    tile_w = args.tile_size[1] if args.tile_size else None
-    grid = _shared_tile_grid(ref_source, mov_source, tile_h, tile_w, args.overlap)
-
     unit = ref_source.unit or "units"
     print(f"reference: {args.reference}  shape={ref_source.base_shape_hw}")
     print(f"moving:    {moving_path}  shape={mov_source.base_shape_hw}")
-    print(f"shared tiles: {len(grid)}  downsample={args.downsample}  unit={unit}")
 
     search_params = _build_search_params(args)
     config = ExhaustiveSearchConfig(
@@ -330,14 +414,39 @@ def main() -> None:
         device=device,
     )
 
+    # --- Coarse global alignment defines tile correspondence -------------
+    if args.init_manifest is not None:
+        coarse_ref_from_mov = _coarse_matrix_from_manifest(args.init_manifest)
+        print(f"coarse alignment: loaded from {args.init_manifest}")
+    else:
+        coarse_ref_from_mov = _compute_coarse_matrix(
+            args.reference,
+            moving_path,
+            ref_channel=ref_channel,
+            mov_channel=mov_channel,
+            coarse_downsample=args.coarse_downsample,
+            search_params=search_params,
+            config=config,
+            search_dim=args.search_dim,
+            pad_scale=args.pad_scale,
+            device=device,
+        )
+    coarse_mov_from_ref = np.linalg.inv(coarse_ref_from_mov)
+
+    tile_h = args.tile_size[0] if args.tile_size else None
+    tile_w = args.tile_size[1] if args.tile_size else None
+    grid = _reference_tile_grid(ref_source, tile_h, tile_w, args.overlap)
+    print(f"reference tiles: {len(grid)}  downsample={args.downsample}  unit={unit}")
+
     tiles_out: list[dict] = []
     skipped = 0
     start_t = time.perf_counter()
 
-    for idx, (wx0, wy0, wx1, wy1) in enumerate(grid):
-        ref_region = _world_to_region(ref_source, wx0, wy0, wx1, wy1)
-        mov_region = _world_to_region(mov_source, wx0, wy0, wx1, wy1)
-        if ref_region is None or mov_region is None:
+    for idx, ref_region in enumerate(grid):
+        mov_region = _predict_moving_region(
+            ref_region, coarse_mov_from_ref, mov_source, args.moving_margin
+        )
+        if mov_region is None:
             skipped += 1
             continue
 
@@ -394,7 +503,6 @@ def main() -> None:
 
         entry = {
             "index": idx,
-            "world_bbox_xyxy": [wx0, wy0, wx1, wy1],
             "reference_region_yxhw": ref_region.to_list(),
             "moving_region_yxhw": mov_region.to_list(),
             "warp": {
@@ -438,6 +546,16 @@ def main() -> None:
             "unit": unit,
             "n_tiles": len(tiles_out),
             "n_skipped": skipped,
+            "moving_margin": args.moving_margin,
+        },
+        "coarse": {
+            "source": (
+                str(args.init_manifest) if args.init_manifest is not None else "internal"
+            ),
+            "downsample": (
+                None if args.init_manifest is not None else args.coarse_downsample
+            ),
+            "matrix_ref_full_from_mov_full": coarse_ref_from_mov.tolist(),
         },
         "search": {
             "search_dim": args.search_dim,
