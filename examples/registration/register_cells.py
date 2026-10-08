@@ -16,6 +16,8 @@ import argparse
 import time
 from pathlib import Path
 
+import torch
+
 from batchmatch import auto_device
 from batchmatch.gradient import (
     CDGradientConfig,
@@ -49,8 +51,10 @@ from batchmatch.translate.config import (
     NCCTranslationConfig,
     NGFTranslationConfig,
 )
+from batchmatch.base.tensordicts import ImageDetail
+from batchmatch.view import render
 from batchmatch.view.config import CheckerboardSpec, EdgeOverlaySpec, OverlaySpec
-from batchmatch.view.composite import render_checkerboard, render_overlay
+from batchmatch.view.composite import render_checkerboard
 from batchmatch.view.display import show_comparison
 from batchmatch.view.preview import render_registration_preview
 
@@ -143,6 +147,42 @@ def _str_to_translation_config(metric: str):
     if metric == "gpc":
         return GPCTranslationConfig()
     raise ValueError(f"Unsupported metric: {metric}")
+
+
+def _stretch(image: torch.Tensor, low_pct: float, high_pct: float, gamma: float) -> torch.Tensor:
+    """Percentile contrast stretch to [0, 1] on a (1, H, W) image, then gamma."""
+    x = render.to_grayscale(render.to_chw(image)).to(torch.float32)
+    # torch.quantile is capped at 16M elements; a strided sample is plenty.
+    flat = x.flatten()
+    flat = flat[:: max(1, flat.numel() // 4_000_000)]
+    nonzero = flat[flat > 0]  # ignore padding / out-of-bounds fill
+    if nonzero.numel() == 0:
+        return torch.zeros_like(x)
+    lo = torch.quantile(nonzero, low_pct / 100.0)
+    hi = torch.quantile(nonzero, high_pct / 100.0)
+    if hi <= lo:
+        return torch.zeros_like(x)
+    return ((x - lo) / (hi - lo)).clamp(0.0, 1.0).pow(gamma)
+
+
+def render_two_color_overlay(
+    reference: ImageDetail,
+    moving: ImageDetail,
+    *,
+    reference_color: tuple[float, float, float] = (0.45, 0.80, 0.80),
+    moving_color: tuple[float, float, float] = (1.0, 0.15, 0.15),
+    low_pct: float = 1.0,
+    high_pct: float = 99.8,
+    gamma: float = 0.7,
+) -> torch.Tensor:
+    """Additive overlay: contrast-stretched reference in teal, moving in red."""
+    ref = _stretch(reference.get(ImageDetail.Keys.IMAGE), low_pct, high_pct, gamma)
+    mov = _stretch(moving.get(ImageDetail.Keys.IMAGE), low_pct, high_pct, gamma)
+    h, w = min(ref.shape[-2], mov.shape[-2]), min(ref.shape[-1], mov.shape[-1])
+    ref, mov = ref[..., :h, :w], mov[..., :h, :w]
+    ref_rgb = ref * torch.tensor(reference_color).view(3, 1, 1)
+    mov_rgb = mov * torch.tensor(moving_color).view(3, 1, 1)
+    return (ref_rgb + mov_rgb).clamp(0.0, 1.0)
 
 
 def export_stacked_registered_tiff(
@@ -279,7 +319,7 @@ def main() -> None:
     )
     overlay_spec = OverlaySpec(alpha=0.5)
     checkerboard = render_checkerboard(preview.reference, preview.moving_warped, checkerboard_spec)
-    overlay = render_overlay(preview.reference, preview.moving_warped, overlay_spec)
+    overlay = render_two_color_overlay(preview.reference, preview.moving_warped)
 
     if args.show:
         show_comparison(preview.reference, preview.moving_warped, mode="overlay", spec=overlay_spec)
