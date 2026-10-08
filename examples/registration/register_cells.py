@@ -42,7 +42,7 @@ from batchmatch.search import (
     ExhaustiveWarpSearch,
     SearchParams,
 )
-from batchmatch.search.config import ScaleRange
+from batchmatch.search.config import AngleRange, ScaleRange
 from batchmatch.search.transform import RegistrationTransform
 from batchmatch.translate.config import (
     GPCTranslationConfig,
@@ -79,6 +79,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs") / "register_cells")
     parser.add_argument("--search-dim", type=int, default=1024)
+    parser.add_argument(
+        "--rotation-min", type=float, default=0.0,
+        help="Minimum rotation angle (deg) to search. Default 0 (no rotation).",
+    )
+    parser.add_argument(
+        "--rotation-max", type=float, default=0.0,
+        help="Maximum rotation angle (deg) to search. Set e.g. 360 for a full sweep.",
+    )
+    parser.add_argument(
+        "--rotation-step", type=float, default=5.0,
+        help="Rotation increment (deg) between search points.",
+    )
+    parser.add_argument("--scale-min", type=float, default=0.9, help="Min isotropic scale.")
+    parser.add_argument("--scale-max", type=float, default=1.5, help="Max isotropic scale.")
+    parser.add_argument("--scale-step", type=float, default=0.01, help="Scale increment.")
     parser.add_argument("--metric", choices=("ncc", "ngf", "gpc"), default="gpc")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--output-prefix", type=str, default="reg_cells")
@@ -202,8 +217,13 @@ def main() -> None:
     print(f"device: {args.device}")
 
     search_params = SearchParams(
-        scale_x=ScaleRange(min_scale=0.9, max_scale=1.5, step=0.01),
-        scale_y=ScaleRange(min_scale=0.9, max_scale=1.5, step=0.01),
+        rotation=AngleRange(
+            min_angle=args.rotation_min,
+            max_angle=args.rotation_max,
+            step=args.rotation_step,
+        ),
+        scale_x=ScaleRange(min_scale=args.scale_min, max_scale=args.scale_max, step=args.scale_step),
+        scale_y=ScaleRange(min_scale=args.scale_min, max_scale=args.scale_max, step=args.scale_step),
     )
     gradient = (
         CDGradientConfig(
