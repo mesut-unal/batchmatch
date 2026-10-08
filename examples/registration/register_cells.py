@@ -95,8 +95,14 @@ def _parse_args() -> argparse.Namespace:
         "--rotation-step", type=float, default=5.0,
         help="Rotation increment (deg) between search points.",
     )
-    parser.add_argument("--scale-min", type=float, default=0.9, help="Min isotropic scale.")
-    parser.add_argument("--scale-max", type=float, default=1.5, help="Max isotropic scale.")
+    parser.add_argument(
+        "--scale-min", type=float, default=0.9,
+        help="Min search scale. NOTE: inverse convention, a value s shrinks the moving image by 1/s.",
+    )
+    parser.add_argument(
+        "--scale-max", type=float, default=1.5,
+        help="Max search scale (inverse convention: s > 1 shrinks the moving image).",
+    )
     parser.add_argument("--scale-step", type=float, default=0.01, help="Scale increment.")
     parser.add_argument("--metric", choices=("ncc", "ngf", "gpc"), default="gpc")
     parser.add_argument("--device", type=str, default="auto")
