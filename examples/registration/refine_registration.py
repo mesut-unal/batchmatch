@@ -11,8 +11,9 @@ across the field. This script measures that offset directly and removes it:
 4. Repeat until the measured offset stops improving.
 
 Outputs (in ``--output-dir``, default: next to the manifest, in ``refine/``):
-``refined_transform.json``, ``block_offsets.csv``, ``report.html`` and
-``report.pdf``.
+``refined_transform.json``, ``block_offsets.csv``, ``report.html``,
+``report.pdf``, and the refined match itself at full reference resolution:
+``moving_warped.png``, ``overlay.png`` and ``checkerboard.png``.
 
 Run:
     uv run python examples/registration/refine_registration.py \
@@ -55,6 +56,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-corr", type=float, default=0.25, help="Reject blocks whose correlation after shifting is lower.")
     parser.add_argument("--max-iters", type=int, default=4)
     parser.add_argument("--tol", type=float, default=0.3, help="Stop when the median offset is below this (px).")
+    parser.add_argument(
+        "--no-images", action="store_true",
+        help="Skip the full-resolution moving_warped / overlay / checkerboard PNGs.",
+    )
     parser.add_argument(
         "--reference-pixel-size", type=float, default=None,
         help="Reference pixel size in um, only used to also print offsets in um.",
@@ -241,6 +246,42 @@ def _crops_figure(
             ax.axis("off")
     fig.suptitle("Reference in teal, moving in red; overlapping nuclei appear pink-white")
     return fig
+
+
+def _stretch_limits(a: np.ndarray) -> tuple[float, float]:
+    sample = a.ravel()[:: max(1, a.size // 4_000_000)]
+    nz = sample[sample > 0]
+    if nz.size == 0:
+        return 0.0, 1.0
+    lo, hi = np.percentile(nz, (1, 99.8))
+    return float(lo), float(max(hi, lo + 1e-6))
+
+
+def save_match_images(out_dir: Path, reference: np.ndarray, warped: np.ndarray, checker: int = 256) -> None:
+    """Write the refined match at full reference resolution.
+
+    ``moving_warped.png`` is the moving image resampled into the reference
+    frame; ``overlay.png`` and ``checkerboard.png`` compare it with the
+    reference. Work is done in row strips to keep memory bounded.
+    """
+    h, w = reference.shape
+    Image.fromarray(np.clip(warped, 0, 255).astype(np.uint8)).save(out_dir / "moving_warped.png")
+
+    ref_lim, mov_lim = _stretch_limits(reference), _stretch_limits(warped)
+    teal = np.array([0.45, 0.80, 0.80], dtype=np.float32)
+    red = np.array([1.0, 0.15, 0.15], dtype=np.float32)
+    overlay = np.empty((h, w, 3), dtype=np.uint8)
+    board = np.empty((h, w), dtype=np.uint8)
+    xs = (np.arange(w) // checker)[None, :]
+    for y in range(0, h, 1024):
+        sl = slice(y, min(y + 1024, h))
+        r = np.clip((reference[sl] - ref_lim[0]) / (ref_lim[1] - ref_lim[0]), 0, 1) ** 0.7
+        m = np.clip((warped[sl] - mov_lim[0]) / (mov_lim[1] - mov_lim[0]), 0, 1) ** 0.7
+        overlay[sl] = (np.clip(r[..., None] * teal + m[..., None] * red, 0, 1) * 255).astype(np.uint8)
+        ys = (np.arange(sl.start, sl.stop) // checker)[:, None]
+        board[sl] = (np.where((xs + ys) % 2 == 0, r, m) * 255).astype(np.uint8)
+    Image.fromarray(overlay).save(out_dir / "overlay.png")
+    Image.fromarray(board).save(out_dir / "checkerboard.png")
 
 
 def _png_data_uri(fig: plt.Figure, dpi: int = 110) -> str:
@@ -484,6 +525,9 @@ def main() -> None:
     for fig in figures:
         plt.close(fig)
 
+    if not args.no_images:
+        save_match_images(out_dir, reference, warped_after)
+
     np.savetxt(
         out_dir / "block_offsets.csv",
         np.c_[last.blocks, (last.blocks[:, 4] > args.min_corr) & (np.hypot(last.blocks[:, 2], last.blocks[:, 3]) < args.max_shift)],
@@ -508,7 +552,9 @@ def main() -> None:
     print(headline_plain)
     print(stop_reason)
     print(f"refined matrix:\n{_matrix_text(m_refined)}")
-    print(f"outputs: {out_dir}/report.html, report.pdf, refined_transform.json, block_offsets.csv")
+    print(f"outputs in {out_dir}: report.html, report.pdf, refined_transform.json, block_offsets.csv")
+    if not args.no_images:
+        print("  refined match: moving_warped.png, overlay.png, checkerboard.png")
 
 
 if __name__ == "__main__":
