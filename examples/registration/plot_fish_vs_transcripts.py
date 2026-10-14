@@ -37,7 +37,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gene", default="EGFR", help="Gene whose <gene>_transcripts column is plotted.")
     p.add_argument("--bins", type=int, default=10, help="Number of equal-sized amplification bins.")
     p.add_argument("--max-spots", type=int, default=6, help="Spot counts at or above this are pooled.")
-    p.add_argument("--heatmap-max", type=int, default=10, help="Spot counts at or above this are pooled in the heatmap.")
+    p.add_argument("--heatmap-max", type=int, default=8, help="Spot counts at or above this are pooled in the heatmap.")
     p.add_argument("--min-cells", type=int, default=30, help="Heatmap squares with fewer cells are left blank.")
     p.add_argument("--output-dir", type=Path, default=None, help="Default: folder of cells.csv")
     return p.parse_args()
@@ -164,27 +164,28 @@ def main() -> None:
 
     ax = grid[1, 2]
     top = args.heatmap_max
-    e = counted["egfr_spots_nuc"].clip(upper=top)
-    c = counted["cep7_spots_nuc"].clip(upper=top)
-    mean_tx = counted.groupby([c, e])[tx].mean().unstack().reindex(index=range(1, top + 1), columns=range(top + 1))
-    n_cells = counted.groupby([c, e]).size().unstack().reindex(index=range(1, top + 1), columns=range(top + 1))
+    # All usable cells, including those without a CEP7 spot (bottom row).
+    e = cells["egfr_spots_nuc"].clip(upper=top)
+    c = cells["cep7_spots_nuc"].clip(upper=top)
+    mean_tx = cells.groupby([c, e])[tx].mean().unstack().reindex(index=range(top + 1), columns=range(top + 1))
+    n_cells = cells.groupby([c, e]).size().unstack().reindex(index=range(top + 1), columns=range(top + 1))
     mean_tx = mean_tx.where(n_cells >= args.min_cells)
     values = mean_tx.to_numpy(dtype=float)
-    im = ax.imshow(values, origin="lower", cmap="viridis", aspect="auto", extent=(-0.5, top + 0.5, 0.5, top + 0.5))
+    im = ax.imshow(values, origin="lower", cmap="viridis", aspect="auto", extent=(-0.5, top + 0.5, -0.5, top + 0.5))
     for (ci, ei), v in np.ndenumerate(values):
         if np.isfinite(v):
-            ax.text(ei, ci + 1, f"{v:.0f}", ha="center", va="center", fontsize=7,
+            ax.text(ei, ci, f"{v:.0f}", ha="center", va="center", fontsize=7,
                     color="white" if v < np.nanmax(values) * 0.6 else INK)
     xs = np.linspace(-0.5, top + 0.5, 50)
     ax.plot(xs, xs, color="white", lw=1, ls=":")
     ax.plot(xs, xs / 2, color=LINE, lw=1.2, ls="--")
     ax.set_xlim(-0.5, top + 0.5)
-    ax.set_ylim(0.5, top + 0.5)
+    ax.set_ylim(-0.5, top + 0.5)
     labels = [str(t) for t in range(top)] + [f"{top}+"]
     ax.set_xticks(range(top + 1), labels)
-    ax.set_yticks(range(1, top + 1), labels[1:])
+    ax.set_yticks(range(top + 1), labels)
     ax.set_xlabel("EGFR spots in the nucleus")
-    ax.set_ylabel("CEP7 spots in the nucleus")
+    ax.set_ylabel("CEP7 spots in the nucleus (0 = no CEP7 spot)")
     ax.set_title(f"Mean {args.gene} transcripts (Xenium) by FISH spot counts\n"
                  f"blank: fewer than {args.min_cells} cells; dotted: ratio 1, dashed: ratio 2")
     fig.colorbar(im, ax=ax, label=f"mean {args.gene} transcripts per cell (Xenium)", shrink=0.8)
