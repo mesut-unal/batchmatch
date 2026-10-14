@@ -66,6 +66,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--tile-scale", type=int, default=4, help="Downscale factor applied when the tile PNG was made.")
     p.add_argument("--tile-rotate", type=int, default=270, choices=(0, 270), help="Counter-clockwise rotation applied when the tile PNG was made.")
     p.add_argument("--xenium-pixel-size", type=float, default=0.2125, help="Full-resolution Xenium pixel size in um.")
+    p.add_argument("--debris-factor", type=float, default=6.0,
+                   help="Debris: probe signal brighter than this many times the median nucleus ...")
+    p.add_argument("--debris-min-nuclei", type=float, default=10.0,
+                   help="... over a connected area larger than this many median nuclei.")
     p.add_argument("--spot-threshold", type=float, default=6.0, help="Spot threshold in robust noise units of the spot-filtered image.")
     return p.parse_args()
 
@@ -151,6 +155,27 @@ def region_stats(channel: np.ndarray, labels: np.ndarray, n: int, background: fl
         f"{prefix}_sum": np.where(area > 0, total - background * area, np.nan),
         f"{prefix}_max": np.where(area > 0, ndi.maximum(channel, labels, idx) - background, np.nan),
     })
+
+
+def find_debris(channels: list[np.ndarray], nuc_lab: np.ndarray, factor: float, min_nuclei: float) -> np.ndarray:
+    """Bright connected regions much larger than a nucleus (tissue folds, dust, fibres).
+
+    Real amplified nuclei can be very bright too, but each one is nucleus-sized;
+    debris is a single bright region spanning many nuclei.
+    """
+    areas = np.bincount(nuc_lab[::2, ::2].ravel())[1:] * 4
+    min_area = min_nuclei * float(np.median(areas[areas > 0]))
+    in_nuc = nuc_lab > 0
+    mask = np.zeros(nuc_lab.shape, dtype=bool)
+    for channel in channels:
+        background = float(np.median(channel[~in_nuc][::16]))
+        smooth = ndi.gaussian_filter(channel, 2.0) - background
+        level = float(np.median(smooth[in_nuc][::16]))
+        labels, _ = ndi.label(smooth > factor * max(level, 1.0))
+        sizes = np.bincount(labels.ravel())
+        big = np.flatnonzero(sizes > min_area)
+        mask |= np.isin(labels, big[big > 0])
+    return ndi.binary_dilation(mask, iterations=10)
 
 
 def detect_spots(channel: np.ndarray, tissue: np.ndarray, threshold: float) -> pd.DataFrame:
@@ -333,6 +358,8 @@ def main() -> None:
     cyto_lab = np.where(nuc_lab == 0, cell_lab, 0)
 
     tissue = ndi.binary_dilation(cell_lab > 0, iterations=10)
+    debris = find_debris([fish["egfr"], fish["cep7"]], nuc_lab, args.debris_factor, args.debris_min_nuclei)
+    print(f"debris: {debris.mean():.3%} of the FISH image")
     spot_tables = []
     for name in ("egfr", "cep7"):
         channel = fish[name]
@@ -347,6 +374,7 @@ def main() -> None:
         in_cell = cell_lab[spots.fish_y, spots.fish_x]
         label = np.where(in_nuc > 0, in_nuc, in_cell)
         spots["location"] = np.where(in_nuc > 0, "nucleus", np.where(in_cell > 0, "extranuclear", "outside_cells"))
+        spots.loc[debris[spots.fish_y, spots.fish_x], "location"] = "debris"
         spots["cell_id"] = np.where(label > 0, cells["cell_id"].to_numpy()[np.maximum(label, 1) - 1], "")
         spots["x_um"], spots["y_um"] = apply_affine(um_from_fish, spots.fish_x + 0.5, spots.fish_y + 0.5)
         for loc, col in (("nucleus", "spots_nuc"), ("extranuclear", "spots_extranuc")):
@@ -355,7 +383,7 @@ def main() -> None:
         spot_tables.append(spots)
         print(f"{name}: background {background:.0f}, {len(spots):,} spots "
               f"({(spots.location == 'nucleus').sum():,} nuclear, {(spots.location == 'extranuclear').sum():,} extranuclear, "
-              f"{(spots.location == 'outside_cells').sum():,} outside cells)")
+              f"{(spots.location == 'outside_cells').sum():,} outside cells, {(spots.location == 'debris').sum():,} on debris)")
     spots = pd.concat(spot_tables, ignore_index=True)
 
     # Is the cell actually present in the FISH image, and is it free of saturated debris?
@@ -368,6 +396,7 @@ def main() -> None:
     cells["saturated"] = (
         np.maximum(ndi.maximum(fish["egfr"], cell_lab, idx), ndi.maximum(fish["cep7"], cell_lab, idx)) >= 65535
     )
+    cells["debris"] = ndi.maximum(debris.astype(np.uint8), cell_lab, idx) > 0
 
     # Drop the columns that duplicate each other, add ratios and transcripts.
     cells = cells.drop(columns=[c for c in cells.columns if c.endswith("_cell_area_px") or c.endswith("_cyto_area_px")] + ["cep7_nuc_area_px"])
@@ -376,7 +405,7 @@ def main() -> None:
         cells["egfr_cep7_nuc_ratio"] = cells["egfr_nuc_mean"] / cells["cep7_nuc_mean"].where(cells["cep7_nuc_mean"] > 0)
     cells = cells.merge(gene_counts(args.xenium_dir / "cell_feature_matrix.h5", args.genes), left_on="cell_id", right_index=True, how="left")
     measured = cells[cells["nucleus_area_fish_px"] > 0]
-    usable = measured[measured["in_fish"] & ~measured["saturated"]]
+    usable = measured[measured["in_fish"] & ~measured["saturated"] & ~measured["debris"]]
 
     cells.to_csv(out_dir / "cells.csv", index=False, float_format="%.4f")
     spots.to_csv(out_dir / "spots.csv", index=False, float_format="%.3f")
@@ -411,10 +440,11 @@ def main() -> None:
         ("Xenium cells inside FISH image", f"{n:,}"),
         ("Cells with a measured nucleus", f"{len(measured):,}"),
         ("Of those, present in FISH (nuclear DAPI above cut)", f"{int(measured['in_fish'].sum()):,} ({measured['in_fish'].mean():.0%}), cut = {dapi_cut:.0f}"),
-        ("Of those, touching saturated signal (debris)", f"{int(measured['saturated'].sum()):,}"),
-        ("Usable cells (present, not saturated)", f"{len(usable):,}"),
-        ("EGFR spots (nuclear / extranuclear / outside cells)", " / ".join(f"{(spots[spots.channel == 'egfr'].location == k).sum():,}" for k in ("nucleus", "extranuclear", "outside_cells"))),
-        ("CEP7 spots (nuclear / extranuclear / outside cells)", " / ".join(f"{(spots[spots.channel == 'cep7'].location == k).sum():,}" for k in ("nucleus", "extranuclear", "outside_cells"))),
+        ("Of those, touching saturated pixels", f"{int(measured['saturated'].sum()):,}"),
+        ("Of those, overlapping debris", f"{int(measured['debris'].sum()):,} (debris covers {debris.mean():.2%} of the image)"),
+        ("Usable cells (present, no saturation, no debris)", f"{len(usable):,}"),
+        ("EGFR spots (nuclear / extranuclear / outside cells / debris)", " / ".join(f"{(spots[spots.channel == 'egfr'].location == k).sum():,}" for k in ("nucleus", "extranuclear", "outside_cells", "debris"))),
+        ("CEP7 spots (nuclear / extranuclear / outside cells / debris)", " / ".join(f"{(spots[spots.channel == 'cep7'].location == k).sum():,}" for k in ("nucleus", "extranuclear", "outside_cells", "debris"))),
         (f"Spearman, EGFR FISH nuclear mean vs {gene} transcripts", f"{rho['egfr_nuc_mean']:.3f}"),
         (f"Spearman, CEP7 FISH nuclear mean vs {gene} transcripts", f"{rho['cep7_nuc_mean']:.3f}"),
     ]
@@ -425,7 +455,9 @@ def main() -> None:
         "they are candidates, not a locus count.",
         "'Extranuclear' means inside the Xenium cell outline but outside its nucleus outline.",
         "A cell counts as present in FISH when the FISH DAPI signal inside its Xenium nucleus outline is above an Otsu cut; "
-        "maps and correlations use only present, non-saturated cells.",
+        "maps and correlations use only present cells that touch neither saturated pixels nor debris.",
+        f"Debris: connected regions brighter than {args.debris_factor:g}x the median nucleus signal and larger than "
+        f"{args.debris_min_nuclei:g} median nuclei, in either probe channel, grown by 10 px. Spots on debris are not counted.",
     ]
     write_reports(out_dir, summary, notes, figures)
     for k, v in summary:
