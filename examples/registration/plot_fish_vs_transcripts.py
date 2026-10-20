@@ -37,6 +37,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gene", default="EGFR", help="Gene whose <gene>_transcripts column is plotted.")
     p.add_argument("--bins", type=int, default=10, help="Number of equal-sized amplification bins.")
     p.add_argument("--max-spots", type=int, default=6, help="Spot counts at or above this are pooled.")
+    p.add_argument("--ratio-bin-width", type=float, default=0.1, help="Bin width of the spot-count ratio histogram.")
     p.add_argument("--heatmap-max", type=int, default=8, help="Spot counts at or above this are pooled in the heatmap.")
     p.add_argument("--min-cells", type=int, default=30, help="Heatmap squares with fewer cells are left blank.")
     p.add_argument("--output-dir", type=Path, default=None, help="Default: folder of cells.csv")
@@ -125,20 +126,24 @@ def main() -> None:
         axes[2].set_xticks(ticks, [str(t) for t in ticks[:-1]] + [f"{args.max_spots}+"])
 
     ax = grid[1, 0]
-    # Bins of width 0.5, left edge included (a ratio of exactly 1 falls in 1-1.5); everything >= 5 pooled.
-    width, last = 0.5, 5.0
-    edges = np.arange(0, last + width, width)
-    heights = np.histogram(counted["spot_ratio"].clip(upper=last - 1e-9), bins=edges)[0]
+    # Left edge included (a ratio of exactly 1 falls in the bin starting at 1); everything >= 5 pooled.
+    width, last = args.ratio_bin_width, 5.0
+    edges = np.round(np.arange(0, last + width / 2, width), 6)
+    below = counted["spot_ratio"][counted["spot_ratio"] < last]
+    heights = np.histogram(below, bins=edges)[0]
     pooled = int((counted["spot_ratio"] >= last).sum())
-    ax.bar(edges[:-1], heights, width=width, align="edge", color="#7f8c8d", edgecolor="white")
-    ax.bar(last, pooled, width=width, align="edge", color="#4d5656", edgecolor="white")
+    edge = "white" if width >= 0.25 else "none"
+    ax.bar(edges[:-1], heights, width=width, align="edge", color="#7f8c8d", edgecolor=edge)
+    pooled_x, pooled_w = last + 0.15, max(width, 0.25)
+    ax.bar(pooled_x, pooled, width=pooled_w, align="edge", color="#4d5656", edgecolor=edge)
     for cut, label, height in ((1, "1", 0.95), (2, "2 (amplified)", 0.85)):
         ax.axvline(cut, color=LINE, lw=1.5, ls="--")
         ax.text(cut + 0.05, ax.get_ylim()[1] * height, f"{(counted['spot_ratio'] >= cut).mean():.0%} at or above {label}",
                 color=LINE, va="top", backgroundcolor="white")
-    ax.set_xticks(list(np.arange(0, last + 0.01, 1.0)) + [last + width / 2], [f"{t:g}" for t in np.arange(0, last + 0.01, 1.0)] + ["5+"])
-    ax.set_xlim(0, last + width)
-    ax.set_xlabel("EGFR spots / CEP7 spots in the nucleus (bins of 0.5; darkest bar: 5 and above)")
+    ticks = np.arange(0, last, 1.0)
+    ax.set_xticks(list(ticks) + [pooled_x + pooled_w / 2], [f"{t:g}" for t in ticks] + [f"{last:g}+"])
+    ax.set_xlim(0, pooled_x + pooled_w + 0.05)
+    ax.set_xlabel(f"EGFR spots / CEP7 spots in the nucleus (bins of {width:g}; darkest bar: 5 and above)")
     ax.set_ylabel("cells")
     ax.set_title(f"Spot-count ratio, cells with at least one CEP7 spot (n = {len(counted):,})")
 
