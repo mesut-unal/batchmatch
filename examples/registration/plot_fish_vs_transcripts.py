@@ -37,7 +37,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gene", default="EGFR", help="Gene whose <gene>_transcripts column is plotted.")
     p.add_argument("--bins", type=int, default=10, help="Number of equal-sized amplification bins.")
     p.add_argument("--max-spots", type=int, default=6, help="Spot counts at or above this are pooled.")
-    p.add_argument("--ratio-bin-width", type=float, default=0.1, help="Bin width of the spot-count ratio histogram.")
+    p.add_argument("--ratio-bin-width", type=float, default=0.5, help="Bin width of the spot-count ratio histogram.")
     p.add_argument("--heatmap-max", type=int, default=8, help="Spot counts at or above this are pooled in the heatmap.")
     p.add_argument("--min-cells", type=int, default=30, help="Heatmap squares with fewer cells are left blank.")
     p.add_argument("--output-dir", type=Path, default=None, help="Default: folder of cells.csv")
