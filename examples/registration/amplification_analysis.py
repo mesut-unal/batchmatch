@@ -191,9 +191,9 @@ def gene_heatmap(expr: np.ndarray, genes: list[str], amp: np.ndarray, table: pd.
     fig, ax = plt.subplots(figsize=(8, 0.28 * len(chosen) + 1.8), constrained_layout=True)
     im = ax.imshow(z, aspect="auto", cmap="RdBu_r", vmin=-2, vmax=2)
     ax.set_yticks(range(len(chosen)), chosen, fontsize=8)
-    ax.set_xticks(range(10), [f"{10 * b}-{10 * b + 10}%" for b in range(10)], rotation=45, ha="right", fontsize=8)
+    ax.set_xticks(range(10), [f"{b / 10:g}-{(b + 1) / 10:g}" for b in range(10)], rotation=45, ha="right", fontsize=8)
     ax.axhline(top - 0.5, color=INK, lw=1)
-    ax.set_xlabel("cells grouped by EGFR/CEP7 FISH ratio (lowest to highest 10%)")
+    ax.set_xlabel("cells grouped by EGFR/CEP7 FISH ratio")
     ax.set_title(f"Top {top} genes rising and falling with amplification (within-cluster rank)")
     fig.colorbar(im, ax=ax, label="mean expression, z-score across groups", shrink=0.6)
     return fig
@@ -210,8 +210,8 @@ def cluster_figure(amp: np.ndarray, cluster: pd.Series) -> plt.Figure:
     for i, col in enumerate(share.columns):
         ax.bar(share.index, share[col], bottom=bottom, color="#d5d9dc" if col == "other" else colors[i % 20], label=str(col))
         bottom += share[col].to_numpy()
-    ax.set_xticks(range(10), [f"{10 * b}-{10 * b + 10}%" for b in range(10)], rotation=45, ha="right")
-    ax.set_xlabel("cells grouped by EGFR/CEP7 FISH ratio (lowest to highest 10%)")
+    ax.set_xticks(range(10), [f"{b / 10:g}-{(b + 1) / 10:g}" for b in range(10)], rotation=45, ha="right")
+    ax.set_xlabel("cells grouped by EGFR/CEP7 FISH ratio")
     ax.set_ylabel("share of cells")
     ax.set_title("Xenium cluster make-up of each amplification group")
     ax.legend(title="cluster", fontsize=7, ncol=2, bbox_to_anchor=(1.01, 1), loc="upper left", frameon=False)
@@ -276,7 +276,7 @@ def ecdna_figure(cells: pd.DataFrame) -> plt.Figure:
     ax.invert_yaxis()
     ax.set_xlabel("FISH x (px)")
     ax.set_ylabel("FISH y (px)")
-    ax.set_title("Where each class sits in the FISH image")
+    ax.set_title("Cell type locations in FISH")
     ax.legend(markerscale=5, frameon=False, fontsize=8, loc="lower left")
     return fig
 

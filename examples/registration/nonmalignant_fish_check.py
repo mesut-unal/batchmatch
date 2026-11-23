@@ -127,7 +127,7 @@ def per_type_table(cells: pd.DataFrame, order: list[str], normal_cep7: int) -> p
 
 
 def cep7_figure(per_type: pd.DataFrame, normal_cep7: int) -> plt.Figure:
-    fig, ax = plt.subplots(figsize=(12, 5.5), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(13, 5.5), constrained_layout=True)
     labels = [f"{g}\n(n={n:,})" for g, n in zip(per_type.group, per_type.cells)]
     left = np.zeros(len(per_type))
     for col, color in zip(["0", "1", "2", "3", "4+"], CEP7_COLORS):
@@ -138,11 +138,18 @@ def cep7_figure(per_type: pd.DataFrame, normal_cep7: int) -> plt.Figure:
     ax.invert_yaxis()
     ax.set_xlim(0, 1)
     ax.set_xlabel("share of cells")
-    nm = per_type[per_type.xenium_call == "non-malignant"]
-    if len(nm):
-        ax.axhline(len(nm) - 0.5, color=INK, lw=1)
-    ax.set_title(f"CEP7 (green) spots per nucleus by Xenium cell type; dark green = {normal_cep7} spots "
-                 "(normal). Non-malignant types above the line.")
+    # Brackets left of the tick labels grouping non-malignant and malignant types.
+    trans = ax.get_yaxis_transform()
+    for call in ("non-malignant", "malignant"):
+        rows = np.flatnonzero(per_type.xenium_call.to_numpy() == call)
+        if not len(rows):
+            continue
+        top, bottom = rows.min() - 0.35, rows.max() + 0.35
+        x = -0.17
+        ax.plot([x + 0.012, x, x, x + 0.012], [top, top, bottom, bottom], color=INK, lw=1.2,
+                transform=trans, clip_on=False)
+        ax.text(x - 0.01, (top + bottom) / 2, call, transform=trans, ha="right", va="center", fontsize=11)
+    ax.set_title("FISH CEP7 spots per nucleus by Xenium cell type")
     ax.legend(ncol=5, frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.12))
     return fig
 
@@ -156,13 +163,16 @@ def agreement_figure(summary: pd.DataFrame, normal_cep7: int) -> plt.Figure:
     fig, axes = plt.subplots(1, 2, figsize=(16, 5.8), constrained_layout=True)
 
     ax = axes[0]
-    bars = ax.bar(range(4), table["cells"], color=["#2e7d5b", "#9fb3c2", "#2e7d5b", "#9fb3c2"])
+    agree_color, disagree_color = "#2e7d5b", "#9fb3c2"
+    bars = ax.bar(range(4), table["cells"], color=[agree_color, disagree_color, agree_color, disagree_color])
     for b, v in zip(bars, table["cells"]):
         ax.text(b.get_x() + b.get_width() / 2, v, f"{int(v):,}", ha="center", va="bottom")
     ax.set_xticks(range(4), labels, fontsize=9)
     ax.set_ylabel("cells")
     ax.set_yscale("log")
-    ax.set_title("Xenium cell type vs FISH chromosome 7 call (green: agree, grey: disagree)")
+    ax.set_title("Xenium cell type vs FISH chromosome 7 call")
+    ax.legend(handles=[plt.Rectangle((0, 0), 1, 1, color=agree_color), plt.Rectangle((0, 0), 1, 1, color=disagree_color)],
+              labels=["agree", "disagree"], frameon=False, loc="upper left")
 
     ax = axes[1]
     bottom = np.zeros(4)
@@ -211,7 +221,8 @@ def egfr_by_type_figure(cells: pd.DataFrame, order: list[str], normal_cep7: int)
 # --------------------------------------------------------------------------
 
 SPOT_MAX = 8
-MAL_COLOR, NON_COLOR = "#c0392b", "#2e7d5b"
+EGFR_RED, CEP7_GREEN, RATIO_COLOR = "#c0392b", "#2e7d5b", "#5b4b8a"
+GROUP_STYLE = {"malignant": "-", "non-malignant": "--"}  # line style separates the groups; colour marks the probe
 
 
 def _features(cells: pd.DataFrame) -> dict[str, pd.Series]:
@@ -219,9 +230,8 @@ def _features(cells: pd.DataFrame) -> dict[str, pd.Series]:
     return {
         "EGFR spots": e,
         "CEP7 spots": c,
-        "EGFR - CEP7 spots": e - c,
-        "EGFR / CEP7 spots (0.5 added to both)": (e + 0.5) / (c + 0.5),
-        "EGFR / CEP7 intensity ratio": cells["egfr_cep7_nuc_ratio"],
+        "EGFR/CEP7 spots": e / c.where(c > 0),  # cells with at least one CEP7 spot
+        "EGFR/CEP7 intensity": cells["egfr_cep7_nuc_ratio"],
     }
 
 
@@ -261,7 +271,7 @@ def _combined_score(cells: pd.DataFrame, is_mal: np.ndarray, seed: int = 0) -> n
 def separation_stats(cells: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, tuple[np.ndarray, float]]]:
     is_mal = (cells["xenium_call"] == "malignant").to_numpy()
     rows, roc_inputs = [], {}
-    feats = _features(cells) | {"EGFR + CEP7 spots combined (cross-fitted)": pd.Series(_combined_score(cells, is_mal), index=cells.index)}
+    feats = _features(cells) | {"EGFR and CEP7 spot counts together": pd.Series(_combined_score(cells, is_mal), index=cells.index)}
     for name, values in feats.items():
         x = values.to_numpy(dtype=float)
         ok = np.isfinite(x)
@@ -275,7 +285,7 @@ def separation_stats(cells: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, tuple
         if name in ("EGFR spots", "CEP7 spots"):
             table = pd.crosstab(np.clip(x, 0, SPOT_MAX), y)
             row["chi2_p"] = chi2_contingency(table.to_numpy())[1]
-        if name in ("EGFR spots", "EGFR / CEP7 spots (0.5 added to both)"):
+        if name in ("EGFR spots", "EGFR/CEP7 spots"):
             best = max(((t, (x[y] >= t).mean(), (x[~y] < t).mean()) for t in np.unique(x)[1:]), key=lambda v: v[1] + v[2])
             row |= {"best_cut_at_or_above": best[0], "sensitivity": best[1], "specificity": best[2]}
         rows.append(row)
@@ -294,13 +304,13 @@ def distribution_figure(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: di
     auc = stats.set_index("feature")["auc"]
 
     panels = (
-        (axes[0, 0], "egfr_spots_nuc", np.arange(SPOT_MAX + 1), "EGFR (red) spots in the nucleus", "EGFR spots"),
-        (axes[0, 1], "cep7_spots_nuc", np.arange(SPOT_MAX + 1), "CEP7 (green) spots in the nucleus", "CEP7 spots"),
+        (axes[0, 0], "egfr_spots_nuc", np.arange(SPOT_MAX + 1), "EGFR spots in the nucleus", "EGFR spots", EGFR_RED),
+        (axes[0, 1], "cep7_spots_nuc", np.arange(SPOT_MAX + 1), "CEP7 spots in the nucleus", "CEP7 spots", CEP7_GREEN),
     )
-    for ax, col, support, xlabel, feat in panels:
-        for sub, color, label in ((mal, MAL_COLOR, "malignant"), (non, NON_COLOR, "non-malignant")):
-            ax.plot(support, 100 * _share(sub[col].clip(upper=SPOT_MAX), support), "-o", color=color, lw=2,
-                    label=f"Xenium {label} (n={len(sub):,}, mean {sub[col].mean():.2f})")
+    for ax, col, support, xlabel, feat, color in panels:
+        for sub, label in ((mal, "malignant"), (non, "non-malignant")):
+            ax.plot(support, 100 * _share(sub[col].clip(upper=SPOT_MAX), support), GROUP_STYLE[label], marker="o",
+                    color=color, lw=2, label=f"Xenium {label} (n={len(sub):,}, mean {sub[col].mean():.2f})")
         ax.set_xticks(support, [str(v) for v in support[:-1]] + [f"{SPOT_MAX}+"])
         ax.set_xlabel(xlabel)
         ax.set_ylabel("share of cells (%)")
@@ -308,27 +318,33 @@ def distribution_figure(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: di
         ax.legend(frameon=False)
 
     ax = axes[1, 0]
-    support = np.arange(-4, 7)
-    for sub, color, label in ((mal, MAL_COLOR, "malignant"), (non, NON_COLOR, "non-malignant")):
-        d = (sub["egfr_spots_nuc"] - sub["cep7_spots_nuc"]).clip(-4, 6)
-        ax.plot(support, 100 * _share(d, support), "-o", color=color, lw=2, label=f"Xenium {label}")
-    ax.axvline(0, color="#7f8c8d", lw=1, ls=":")
-    ax.set_xticks(support, ["<=-4"] + [str(v) for v in support[1:-1]] + ["6+"])
-    ax.set_xlabel("EGFR spots minus CEP7 spots (0 = equal red and green)")
+    edges = [0, 0.5, 1, 1.5, 2, 3, np.inf]
+    names = ["<0.5", "0.5-1", "1-1.5", "1.5-2", "2-3", ">=3"]
+    for sub, label in ((mal, "malignant"), (non, "non-malignant")):
+        counted = sub[sub["cep7_spots_nuc"] > 0]
+        ratio = counted["egfr_spots_nuc"] / counted["cep7_spots_nuc"]
+        share = pd.cut(ratio, edges, right=False, labels=names).value_counts(normalize=True).reindex(names)
+        ax.plot(range(len(names)), 100 * share.to_numpy(), GROUP_STYLE[label], marker="o", color=RATIO_COLOR, lw=2,
+                label=f"Xenium {label} (n={len(counted):,})")
+    ax.set_xticks(range(len(names)), names)
+    ax.set_xlabel("EGFR/CEP7 spots (cells with at least one CEP7 spot)")
     ax.set_ylabel("share of cells (%)")
-    ax.set_title(f"Red minus green: AUC = {auc['EGFR - CEP7 spots']:.3f}")
+    ax.set_title(f"EGFR/CEP7: AUC = {auc['EGFR/CEP7 spots']:.3f}")
     ax.legend(frameon=False)
 
     ax = axes[1, 1]
-    for (name, (x, y)), color in zip(roc_inputs.items(), plt.get_cmap("tab10").colors):
+    roc_colors = {"EGFR spots": EGFR_RED, "CEP7 spots": CEP7_GREEN, "EGFR/CEP7 spots": RATIO_COLOR,
+                  "EGFR/CEP7 intensity": "#e0a33a", "EGFR and CEP7 spot counts together": INK}
+    for name, (x, y) in roc_inputs.items():
+        color = roc_colors.get(name, "#7f8c8d")
         cuts = np.unique(x)[::-1]
         tpr = [(x[y] >= t).mean() for t in cuts]
         fpr = [(x[~y] >= t).mean() for t in cuts]
         ax.plot(np.r_[0, fpr, 1], np.r_[0, tpr, 1], color=color, lw=1.8, label=f"{name}: AUC {auc[name]:.3f}")
     ax.plot([0, 1], [0, 1], color="#c9ced2", ls=":", lw=1)
-    ax.set_xlabel("false-positive rate (non-malignant called malignant)")
-    ax.set_ylabel("true-positive rate (malignant called malignant)")
-    ax.set_title("ROC: calling a cell malignant from FISH (0.5 = no better than chance)")
+    ax.set_xlabel("FP rate (non-malignant called malignant)")
+    ax.set_ylabel("TP rate (malignant called malignant)")
+    ax.set_title("ROC: calling a cell malignant from FISH")
     ax.legend(frameon=False, fontsize=8, loc="lower right")
     return fig
 
