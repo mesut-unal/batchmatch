@@ -221,8 +221,8 @@ def egfr_by_type_figure(cells: pd.DataFrame, order: list[str], normal_cep7: int)
 # --------------------------------------------------------------------------
 
 SPOT_MAX = 8
-EGFR_RED, CEP7_GREEN, RATIO_COLOR = "#c0392b", "#2e7d5b", "#5b4b8a"
-GROUP_STYLE = {"malignant": "-", "non-malignant": "--"}  # line style separates the groups; colour marks the probe
+MAL_COLOR, NON_COLOR = "#c0392b", "#2e7d5b"  # distribution curves: malignant vs non-malignant
+EGFR_RED, CEP7_GREEN, RATIO_COLOR = "#c0392b", "#2e7d5b", "#5b4b8a"  # ROC curves: one colour per FISH measure
 
 
 def _features(cells: pd.DataFrame) -> dict[str, pd.Series]:
@@ -297,56 +297,59 @@ def _share(values: pd.Series, support: np.ndarray) -> np.ndarray:
     return values.value_counts(normalize=True).reindex(support, fill_value=0).to_numpy()
 
 
-def distribution_figure(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: dict) -> plt.Figure:
+def distribution_figures(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: dict) -> list[tuple[str, plt.Figure]]:
+    """Malignant vs non-malignant spot distributions and the ROC curves, one figure each."""
     mal = cells[cells.xenium_call == "malignant"]
     non = cells[cells.xenium_call == "non-malignant"]
-    fig, axes = plt.subplots(2, 2, figsize=(16, 11), constrained_layout=True)
+    groups = ((mal, MAL_COLOR, "malignant"), (non, NON_COLOR, "non-malignant"))
     auc = stats.set_index("feature")["auc"]
+    out = []
 
-    panels = (
-        (axes[0, 0], "egfr_spots_nuc", np.arange(SPOT_MAX + 1), "EGFR spots in the nucleus", "EGFR spots", EGFR_RED),
-        (axes[0, 1], "cep7_spots_nuc", np.arange(SPOT_MAX + 1), "CEP7 spots in the nucleus", "CEP7 spots", CEP7_GREEN),
-    )
-    for ax, col, support, xlabel, feat, color in panels:
-        for sub, label in ((mal, "malignant"), (non, "non-malignant")):
-            ax.plot(support, 100 * _share(sub[col].clip(upper=SPOT_MAX), support), GROUP_STYLE[label], marker="o",
-                    color=color, lw=2, label=f"Xenium {label} (n={len(sub):,}, mean {sub[col].mean():.2f})")
+    for col, xlabel, feat in (("egfr_spots_nuc", "EGFR spots in the nucleus", "EGFR spots"),
+                              ("cep7_spots_nuc", "CEP7 spots in the nucleus", "CEP7 spots")):
+        fig, ax = plt.subplots(figsize=(8, 5.5), constrained_layout=True)
+        support = np.arange(SPOT_MAX + 1)
+        for sub, color, label in groups:
+            ax.plot(support, 100 * _share(sub[col].clip(upper=SPOT_MAX), support), "-o", color=color, lw=2,
+                    label=f"Xenium {label} (n={len(sub):,}, mean {sub[col].mean():.2f})")
         ax.set_xticks(support, [str(v) for v in support[:-1]] + [f"{SPOT_MAX}+"])
         ax.set_xlabel(xlabel)
         ax.set_ylabel("share of cells (%)")
         ax.set_title(f"{xlabel}: AUC = {auc[feat]:.3f}")
         ax.legend(frameon=False)
+        out.append((f"{feat} distribution malignant vs non-malignant", fig))
 
-    ax = axes[1, 0]
+    fig, ax = plt.subplots(figsize=(8, 5.5), constrained_layout=True)
     edges = [0, 0.5, 1, 1.5, 2, 3, np.inf]
     names = ["<0.5", "0.5-1", "1-1.5", "1.5-2", "2-3", ">=3"]
-    for sub, label in ((mal, "malignant"), (non, "non-malignant")):
+    for sub, color, label in groups:
         counted = sub[sub["cep7_spots_nuc"] > 0]
         ratio = counted["egfr_spots_nuc"] / counted["cep7_spots_nuc"]
         share = pd.cut(ratio, edges, right=False, labels=names).value_counts(normalize=True).reindex(names)
-        ax.plot(range(len(names)), 100 * share.to_numpy(), GROUP_STYLE[label], marker="o", color=RATIO_COLOR, lw=2,
-                label=f"Xenium {label} (n={len(counted):,})")
+        ax.plot(range(len(names)), 100 * share.to_numpy(), "-o", color=color, lw=2, label=f"Xenium {label} (n={len(counted):,})")
     ax.set_xticks(range(len(names)), names)
     ax.set_xlabel("EGFR/CEP7 spots (cells with at least one CEP7 spot)")
     ax.set_ylabel("share of cells (%)")
     ax.set_title(f"EGFR/CEP7: AUC = {auc['EGFR/CEP7 spots']:.3f}")
     ax.legend(frameon=False)
+    out.append(("EGFR CEP7 spot ratio distribution malignant vs non-malignant", fig))
 
-    ax = axes[1, 1]
+    fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
     roc_colors = {"EGFR spots": EGFR_RED, "CEP7 spots": CEP7_GREEN, "EGFR/CEP7 spots": RATIO_COLOR,
                   "EGFR/CEP7 intensity": "#e0a33a", "EGFR and CEP7 spot counts together": INK}
     for name, (x, y) in roc_inputs.items():
-        color = roc_colors.get(name, "#7f8c8d")
         cuts = np.unique(x)[::-1]
         tpr = [(x[y] >= t).mean() for t in cuts]
         fpr = [(x[~y] >= t).mean() for t in cuts]
-        ax.plot(np.r_[0, fpr, 1], np.r_[0, tpr, 1], color=color, lw=1.8, label=f"{name}: AUC {auc[name]:.3f}")
+        ax.plot(np.r_[0, fpr, 1], np.r_[0, tpr, 1], color=roc_colors.get(name, "#7f8c8d"), lw=1.8,
+                label=f"{name}: AUC {auc[name]:.3f}")
     ax.plot([0, 1], [0, 1], color="#c9ced2", ls=":", lw=1)
-    ax.set_xlabel("FP rate (non-malignant called malignant)")
-    ax.set_ylabel("TP rate (malignant called malignant)")
+    ax.set_xlabel("Xenium FP rate (non-malignant called malignant)")
+    ax.set_ylabel("Xenium TP rate (malignant called malignant)")
     ax.set_title("ROC: calling a cell malignant from FISH")
-    ax.legend(frameon=False, fontsize=8, loc="lower right")
-    return fig
+    ax.legend(frameon=False, fontsize=9, loc="lower right")
+    out.append(("ROC malignant from FISH", fig))
+    return out
 
 
 def _uri(fig: plt.Figure) -> str:
@@ -435,7 +438,7 @@ def main() -> None:
         ("EGFR amplification in non-malignant cells", egfr_by_type_figure(cells, order, args.normal_cep7)),
     ]
     stats, roc_inputs = separation_stats(cells)
-    figures.append(("Malignant vs non-malignant spot distributions", distribution_figure(cells, stats, roc_inputs)))
+    figures += distribution_figures(cells, stats, roc_inputs)
     best = stats.loc[stats["auc"].idxmax()]
     notes += [
         "Separation: AUC is the chance that a random Xenium-malignant cell scores higher than a random non-malignant one "
