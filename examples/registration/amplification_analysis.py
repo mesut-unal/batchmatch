@@ -30,6 +30,7 @@ import argparse
 import base64
 import io
 import textwrap
+import re
 from pathlib import Path
 
 import h5py
@@ -289,6 +290,15 @@ def _uri(fig: plt.Figure) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def save_plots(out_dir: Path, prefix: str, figures: list[tuple[str, plt.Figure]]) -> None:
+    """Save every figure as its own PNG under <out_dir>/plots."""
+    plot_dir = out_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    for title, fig in figures:
+        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+        fig.savefig(plot_dir / f"{prefix}_{slug}.png", dpi=130)
+
+
 def write_report(out_dir: Path, sections: list[tuple[str, list[str], list[tuple[str, plt.Figure]], pd.DataFrame | None]]) -> None:
     parts = []
     for title, notes, figs, table in sections:
@@ -402,6 +412,7 @@ def main() -> None:
         ], show),
         ("ecDNA candidates", ecdna_notes, [("Amplification classes", ecdna_figure(cells))], summary),
     ]
+    save_plots(out_dir, "amplification", [f for _, _, figs, _ in sections for f in figs])
     write_report(out_dir, sections)
     print(f"outputs in {out_dir}: genes_vs_amplification.csv, ecdna_cells.csv, amplification_report.html, .pdf")
 

@@ -200,6 +200,8 @@ def main() -> None:
     )
     fig.savefig(out_dir / "transcription_vs_amplification.png", dpi=130)
     fig.savefig(out_dir / "transcription_vs_amplification.pdf")
+    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_dir / "plots" / "transcription_vs_amplification.png", dpi=130)
 
     by_ratio.insert(0, "grouping", "ratio_bin")
     by_spots.insert(0, "grouping", "nuclear_spots")

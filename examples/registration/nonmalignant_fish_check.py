@@ -27,6 +27,7 @@ import argparse
 import base64
 import io
 import textwrap
+import re
 from pathlib import Path
 
 import matplotlib
@@ -36,6 +37,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_pdf import PdfPages
+from scipy.stats import chi2_contingency, mannwhitneyu, rankdata
 
 NON_MALIGNANT = ["Endothelial", "Pericyte", "Myeloid", "Neuron", "Oligodendrocyte", "T cell"]
 MALIGNANT = ["AC-like", "MES-like", "OPC-like", "Cycling"]
@@ -204,10 +206,146 @@ def egfr_by_type_figure(cells: pd.DataFrame, order: list[str], normal_cep7: int)
     return fig
 
 
+# --------------------------------------------------------------------------
+# How well do red / green spots separate malignant from non-malignant?
+# --------------------------------------------------------------------------
+
+SPOT_MAX = 8
+MAL_COLOR, NON_COLOR = "#c0392b", "#2e7d5b"
+
+
+def _features(cells: pd.DataFrame) -> dict[str, pd.Series]:
+    e, c = cells["egfr_spots_nuc"], cells["cep7_spots_nuc"]
+    return {
+        "EGFR spots": e,
+        "CEP7 spots": c,
+        "EGFR - CEP7 spots": e - c,
+        "EGFR / CEP7 spots (0.5 added to both)": (e + 0.5) / (c + 0.5),
+        "EGFR / CEP7 intensity ratio": cells["egfr_cep7_nuc_ratio"],
+    }
+
+
+def _auc(score: np.ndarray, is_mal: np.ndarray) -> float:
+    """Probability that a random malignant cell scores higher than a random non-malignant one (ties count half)."""
+    r = rankdata(score)
+    n1, n0 = is_mal.sum(), (~is_mal).sum()
+    return float((r[is_mal].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+def _auc_ci(score: np.ndarray, is_mal: np.ndarray, reps: int = 200, seed: int = 0) -> tuple[float, float]:
+    rng = np.random.default_rng(seed)
+    mal, non = np.flatnonzero(is_mal), np.flatnonzero(~is_mal)
+    vals = []
+    for _ in range(reps):
+        idx = np.r_[rng.choice(mal, len(mal)), rng.choice(non, len(non))]
+        vals.append(_auc(score[idx], is_mal[idx]))
+    return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
+
+
+def _combined_score(cells: pd.DataFrame, is_mal: np.ndarray, seed: int = 0) -> np.ndarray:
+    """Cross-fitted malignant fraction per (EGFR, CEP7) spot-count pair: the best score red + green counts allow."""
+    e = cells["egfr_spots_nuc"].clip(upper=SPOT_MAX).to_numpy()
+    c = cells["cep7_spots_nuc"].clip(upper=SPOT_MAX).to_numpy()
+    key = e * (SPOT_MAX + 1) + c
+    fold = np.random.default_rng(seed).integers(0, 2, len(cells))
+    prior = is_mal.mean()
+    score = np.empty(len(cells))
+    for k in (0, 1):
+        train, test = fold != k, fold == k
+        n = np.bincount(key[train], minlength=(SPOT_MAX + 1) ** 2)
+        m = np.bincount(key[train], weights=is_mal[train], minlength=(SPOT_MAX + 1) ** 2)
+        score[test] = ((m + 10 * prior) / (n + 10))[key[test]]
+    return score
+
+
+def separation_stats(cells: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, tuple[np.ndarray, float]]]:
+    is_mal = (cells["xenium_call"] == "malignant").to_numpy()
+    rows, roc_inputs = [], {}
+    feats = _features(cells) | {"EGFR + CEP7 spots combined (cross-fitted)": pd.Series(_combined_score(cells, is_mal), index=cells.index)}
+    for name, values in feats.items():
+        x = values.to_numpy(dtype=float)
+        ok = np.isfinite(x)
+        x, y = x[ok], is_mal[ok]
+        auc = _auc(x, y)
+        lo, hi = _auc_ci(x, y)
+        p = mannwhitneyu(x[y], x[~y]).pvalue
+        row = {"feature": name, "auc": auc, "auc_ci95_low": lo, "auc_ci95_high": hi, "mannwhitney_p": p,
+               "median_malignant": float(np.median(x[y])), "median_non_malignant": float(np.median(x[~y])),
+               "mean_malignant": float(x[y].mean()), "mean_non_malignant": float(x[~y].mean())}
+        if name in ("EGFR spots", "CEP7 spots"):
+            table = pd.crosstab(np.clip(x, 0, SPOT_MAX), y)
+            row["chi2_p"] = chi2_contingency(table.to_numpy())[1]
+        if name in ("EGFR spots", "EGFR / CEP7 spots (0.5 added to both)"):
+            best = max(((t, (x[y] >= t).mean(), (x[~y] < t).mean()) for t in np.unique(x)[1:]), key=lambda v: v[1] + v[2])
+            row |= {"best_cut_at_or_above": best[0], "sensitivity": best[1], "specificity": best[2]}
+        rows.append(row)
+        roc_inputs[name] = (x, y)
+    return pd.DataFrame(rows), roc_inputs
+
+
+def _share(values: pd.Series, support: np.ndarray) -> np.ndarray:
+    return values.value_counts(normalize=True).reindex(support, fill_value=0).to_numpy()
+
+
+def distribution_figure(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: dict) -> plt.Figure:
+    mal = cells[cells.xenium_call == "malignant"]
+    non = cells[cells.xenium_call == "non-malignant"]
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11), constrained_layout=True)
+    auc = stats.set_index("feature")["auc"]
+
+    panels = (
+        (axes[0, 0], "egfr_spots_nuc", np.arange(SPOT_MAX + 1), "EGFR (red) spots in the nucleus", "EGFR spots"),
+        (axes[0, 1], "cep7_spots_nuc", np.arange(SPOT_MAX + 1), "CEP7 (green) spots in the nucleus", "CEP7 spots"),
+    )
+    for ax, col, support, xlabel, feat in panels:
+        for sub, color, label in ((mal, MAL_COLOR, "malignant"), (non, NON_COLOR, "non-malignant")):
+            ax.plot(support, 100 * _share(sub[col].clip(upper=SPOT_MAX), support), "-o", color=color, lw=2,
+                    label=f"Xenium {label} (n={len(sub):,}, mean {sub[col].mean():.2f})")
+        ax.set_xticks(support, [str(v) for v in support[:-1]] + [f"{SPOT_MAX}+"])
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("share of cells (%)")
+        ax.set_title(f"{xlabel}: AUC = {auc[feat]:.3f}")
+        ax.legend(frameon=False)
+
+    ax = axes[1, 0]
+    support = np.arange(-4, 7)
+    for sub, color, label in ((mal, MAL_COLOR, "malignant"), (non, NON_COLOR, "non-malignant")):
+        d = (sub["egfr_spots_nuc"] - sub["cep7_spots_nuc"]).clip(-4, 6)
+        ax.plot(support, 100 * _share(d, support), "-o", color=color, lw=2, label=f"Xenium {label}")
+    ax.axvline(0, color="#7f8c8d", lw=1, ls=":")
+    ax.set_xticks(support, ["<=-4"] + [str(v) for v in support[1:-1]] + ["6+"])
+    ax.set_xlabel("EGFR spots minus CEP7 spots (0 = equal red and green)")
+    ax.set_ylabel("share of cells (%)")
+    ax.set_title(f"Red minus green: AUC = {auc['EGFR - CEP7 spots']:.3f}")
+    ax.legend(frameon=False)
+
+    ax = axes[1, 1]
+    for (name, (x, y)), color in zip(roc_inputs.items(), plt.get_cmap("tab10").colors):
+        cuts = np.unique(x)[::-1]
+        tpr = [(x[y] >= t).mean() for t in cuts]
+        fpr = [(x[~y] >= t).mean() for t in cuts]
+        ax.plot(np.r_[0, fpr, 1], np.r_[0, tpr, 1], color=color, lw=1.8, label=f"{name}: AUC {auc[name]:.3f}")
+    ax.plot([0, 1], [0, 1], color="#c9ced2", ls=":", lw=1)
+    ax.set_xlabel("false-positive rate (non-malignant called malignant)")
+    ax.set_ylabel("true-positive rate (malignant called malignant)")
+    ax.set_title("ROC: calling a cell malignant from FISH (0.5 = no better than chance)")
+    ax.legend(frameon=False, fontsize=8, loc="lower right")
+    return fig
+
+
 def _uri(fig: plt.Figure) -> str:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=100)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def save_plots(out_dir: Path, prefix: str, figures: list[tuple[str, plt.Figure]]) -> None:
+    """Save every figure as its own PNG under <out_dir>/plots."""
+    plot_dir = out_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    for title, fig in figures:
+        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+        fig.savefig(plot_dir / f"{prefix}_{slug}.png", dpi=130)
 
 
 def write_report(out_dir: Path, notes: list[str], tables: list[tuple[str, pd.DataFrame]], figures: list[tuple[str, plt.Figure]]) -> None:
@@ -280,12 +418,25 @@ def main() -> None:
         ("Agreement and EGFR status", agreement_figure(summary, args.normal_cep7)),
         ("EGFR amplification in non-malignant cells", egfr_by_type_figure(cells, order, args.normal_cep7)),
     ]
-    tables = [("Agreement groups", summary), ("Per cell type", per_type)]
+    stats, roc_inputs = separation_stats(cells)
+    figures.append(("Malignant vs non-malignant spot distributions", distribution_figure(cells, stats, roc_inputs)))
+    best = stats.loc[stats["auc"].idxmax()]
+    notes += [
+        "Separation: AUC is the chance that a random Xenium-malignant cell scores higher than a random non-malignant one "
+        "(0.5 = no separation, 1 = perfect). With tens of thousands of cells even tiny differences have very small p-values, "
+        "so judge separation by AUC, not p.",
+        f"Best single FISH score: {best.feature}, AUC {best.auc:.3f} (95% CI {best.auc_ci95_low:.3f}-{best.auc_ci95_high:.3f}).",
+    ]
+    print(stats[["feature", "auc", "auc_ci95_low", "auc_ci95_high", "mannwhitney_p", "mean_malignant", "mean_non_malignant"]]
+          .to_string(index=False, float_format=lambda v: f"{v:.3g}"))
+    stats.to_csv(out_dir / "nonmalignant_separation_stats.csv", index=False, float_format="%.4g")
+    tables = [("Agreement groups", summary), ("Per cell type", per_type), ("Separating malignant from non-malignant", stats)]
     cols = ["cell_id", "group", "xenium_call", "fish_call", "agreement", "cep7_spots_nuc", "egfr_spots_nuc",
             "egfr_status", "egfr_cep7_nuc_ratio", "EGFR_transcripts", "fish_x", "fish_y", "x_centroid", "y_centroid"]
     cells[[c for c in cols if c in cells]].to_csv(out_dir / "nonmalignant_cells.csv", index=False, float_format="%.4f")
     pd.concat([summary.assign(table="agreement"), per_type.assign(table="per_type")]).to_csv(
         out_dir / "nonmalignant_summary.csv", index=False, float_format="%.3f")
+    save_plots(out_dir, "nonmalignant", figures)
     write_report(out_dir, notes, tables, figures)
     print(f"outputs in {out_dir}: nonmalignant_cells.csv, nonmalignant_summary.csv, nonmalignant_report.html, .pdf")
 

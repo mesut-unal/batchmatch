@@ -276,6 +276,15 @@ def _uri(fig: plt.Figure, dpi: int = 100) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def save_plots(out_dir: Path, prefix: str, figures: list[tuple[str, plt.Figure]]) -> None:
+    """Save every figure as its own PNG under <out_dir>/plots."""
+    plot_dir = out_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    for title, fig in figures:
+        slug = re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+        fig.savefig(plot_dir / f"{prefix}_{slug}.png", dpi=130)
+
+
 def write_reports(out_dir: Path, summary: list[tuple[str, str]], notes: list[str], figures: list[tuple[str, plt.Figure]]) -> None:
     rows = "".join(f"<tr><th>{k}</th><td>{v}</td></tr>" for k, v in summary)
     figs = "".join(f"<h2>{t}</h2><img src='{_uri(f)}' alt='{t}'>" for t, f in figures)
@@ -459,6 +468,7 @@ def main() -> None:
         f"Debris: connected regions brighter than {args.debris_factor:g}x the median nucleus signal and larger than "
         f"{args.debris_min_nuclei:g} median nuclei, in either probe channel, grown by 10 px. Spots on debris are not counted.",
     ]
+    save_plots(out_dir, "cells", figures)
     write_reports(out_dir, summary, notes, figures)
     for k, v in summary:
         print(f"{k}: {v}")
