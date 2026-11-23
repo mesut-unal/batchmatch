@@ -344,8 +344,8 @@ def distribution_figures(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: d
         ax.plot(np.r_[0, fpr, 1], np.r_[0, tpr, 1], color=roc_colors.get(name, "#7f8c8d"), lw=1.8,
                 label=f"{name}: AUC {auc[name]:.3f}")
     ax.plot([0, 1], [0, 1], color="#c9ced2", ls=":", lw=1)
-    ax.set_xlabel("Xenium FP rate (non-malignant called malignant)")
-    ax.set_ylabel("Xenium TP rate (malignant called malignant)")
+    ax.set_xlabel("FP rate: Xenium non-malignant cells called malignant by FISH")
+    ax.set_ylabel("TP rate: Xenium malignant cells called malignant by FISH")
     ax.set_title("ROC: calling a cell malignant from FISH")
     ax.legend(frameon=False, fontsize=9, loc="lower right")
     out.append(("ROC malignant from FISH", fig))
