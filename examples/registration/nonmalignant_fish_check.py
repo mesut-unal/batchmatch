@@ -298,7 +298,7 @@ def distribution_figures(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: d
         ax.set_xticks(support, [str(v) for v in support[:-1]] + [f"{SPOT_MAX}+"])
         ax.set_xlabel(xlabel)
         ax.set_ylabel("share of cells (%)")
-        ax.set_title(f"{xlabel}: AUC = {auc[feat]:.3f}")
+        ax.set_title(f"{xlabel}: malignant vs non-malignant")
         ax.legend(frameon=False)
         out.append((f"{feat} distribution malignant vs non-malignant", fig))
 
@@ -317,25 +317,28 @@ def distribution_figures(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: d
     ax.set_xticks([0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4], ["0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4+"])
     ax.set_xlabel("EGFR/CEP7 spots (cells with at least one CEP7 spot)")
     ax.set_ylabel("density of cells")
-    ax.set_title(f"EGFR/CEP7: AUC = {auc['EGFR/CEP7 spots']:.3f}")
+    ax.set_title("EGFR/CEP7 spots: malignant vs non-malignant")
     ax.legend(frameon=False)
     out.append(("EGFR CEP7 spot ratio distribution malignant vs non-malignant", fig))
 
-    fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
     roc_colors = {"EGFR spots": EGFR_RED, "CEP7 spots": CEP7_GREEN, "EGFR/CEP7 spots": RATIO_COLOR,
                   "EGFR/CEP7 intensity": "#e0a33a"}
-    for name, (x, y) in roc_inputs.items():
-        cuts = np.unique(x)[::-1]
-        tpr = [(x[y] >= t).mean() for t in cuts]
-        fpr = [(x[~y] >= t).mean() for t in cuts]
-        ax.plot(np.r_[0, fpr, 1], np.r_[0, tpr, 1], color=roc_colors.get(name, "#7f8c8d"), lw=1.8,
-                label=f"{name}: AUC {auc[name]:.3f}")
-    ax.plot([0, 1], [0, 1], color="#c9ced2", ls=":", lw=1)
-    ax.set_xlabel("FP rate: Xenium non-malignant cells called malignant by FISH")
-    ax.set_ylabel("TP rate: Xenium malignant cells called malignant by FISH")
-    ax.set_title("ROC: calling a cell malignant from FISH")
-    ax.legend(frameon=False, fontsize=9, loc="lower right")
-    out.append(("ROC malignant from FISH", fig))
+    for keep, slug in ((None, "ROC malignant from FISH"), (("EGFR spots", "CEP7 spots"), "ROC malignant from FISH EGFR and CEP7 only")):
+        fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
+        for name, (x, y) in roc_inputs.items():
+            if keep is not None and name not in keep:
+                continue
+            cuts = np.unique(x)[::-1]
+            tpr = [(x[y] >= t).mean() for t in cuts]
+            fpr = [(x[~y] >= t).mean() for t in cuts]
+            ax.plot(np.r_[0, fpr, 1], np.r_[0, tpr, 1], color=roc_colors.get(name, "#7f8c8d"), lw=1.8,
+                    label=f"{name}: AUC {auc[name]:.3f}")
+        ax.plot([0, 1], [0, 1], color="#c9ced2", ls=":", lw=1)
+        ax.set_xlabel("FP rate: Xenium non-malignant cells called malignant by FISH")
+        ax.set_ylabel("TP rate: Xenium malignant cells called malignant by FISH")
+        ax.set_title("ROC: calling a cell malignant from FISH")
+        ax.legend(frameon=False, fontsize=9, loc="lower right")
+        out.append((slug, fig))
     return out
 
 
