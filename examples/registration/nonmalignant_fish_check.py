@@ -252,27 +252,10 @@ def _auc_ci(score: np.ndarray, is_mal: np.ndarray, reps: int = 200, seed: int = 
     return float(np.percentile(vals, 2.5)), float(np.percentile(vals, 97.5))
 
 
-def _combined_score(cells: pd.DataFrame, is_mal: np.ndarray, seed: int = 0) -> np.ndarray:
-    """Cross-fitted malignant fraction per (EGFR, CEP7) spot-count pair: the best score red + green counts allow."""
-    e = cells["egfr_spots_nuc"].clip(upper=SPOT_MAX).to_numpy()
-    c = cells["cep7_spots_nuc"].clip(upper=SPOT_MAX).to_numpy()
-    key = e * (SPOT_MAX + 1) + c
-    fold = np.random.default_rng(seed).integers(0, 2, len(cells))
-    prior = is_mal.mean()
-    score = np.empty(len(cells))
-    for k in (0, 1):
-        train, test = fold != k, fold == k
-        n = np.bincount(key[train], minlength=(SPOT_MAX + 1) ** 2)
-        m = np.bincount(key[train], weights=is_mal[train], minlength=(SPOT_MAX + 1) ** 2)
-        score[test] = ((m + 10 * prior) / (n + 10))[key[test]]
-    return score
-
-
 def separation_stats(cells: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, tuple[np.ndarray, float]]]:
     is_mal = (cells["xenium_call"] == "malignant").to_numpy()
     rows, roc_inputs = [], {}
-    feats = _features(cells) | {"EGFR and CEP7 spot counts together": pd.Series(_combined_score(cells, is_mal), index=cells.index)}
-    for name, values in feats.items():
+    for name, values in _features(cells).items():
         x = values.to_numpy(dtype=float)
         ok = np.isfinite(x)
         x, y = x[ok], is_mal[ok]
@@ -320,23 +303,27 @@ def distribution_figures(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: d
         out.append((f"{feat} distribution malignant vs non-malignant", fig))
 
     fig, ax = plt.subplots(figsize=(8, 5.5), constrained_layout=True)
-    edges = [0, 0.5, 1, 1.5, 2, 3, np.inf]
-    names = ["<0.5", "0.5-1", "1-1.5", "1.5-2", "2-3", ">=3"]
+    grid = np.linspace(0, 4, 401)
+    bandwidth = 0.15
     for sub, color, label in groups:
         counted = sub[sub["cep7_spots_nuc"] > 0]
-        ratio = counted["egfr_spots_nuc"] / counted["cep7_spots_nuc"]
-        share = pd.cut(ratio, edges, right=False, labels=names).value_counts(normalize=True).reindex(names)
-        ax.plot(range(len(names)), 100 * share.to_numpy(), "-o", color=color, lw=2, label=f"Xenium {label} (n={len(counted):,})")
-    ax.set_xticks(range(len(names)), names)
+        ratio = (counted["egfr_spots_nuc"] / counted["cep7_spots_nuc"]).clip(upper=4).to_numpy()
+        kernel = np.exp(-0.5 * ((grid[:, None] - ratio[None, :]) / bandwidth) ** 2)
+        density = kernel.sum(1) / (len(ratio) * bandwidth * np.sqrt(2 * np.pi))
+        ax.plot(grid, density, color=color, lw=2, label=f"Xenium {label} (n={len(counted):,})")
+    ax.axvline(1, color="#7f8c8d", ls="--", lw=1.2)
+    ax.text(1.03, ax.get_ylim()[1] * 0.95, "ratio = 1", color="#7f8c8d", va="top")
+    ax.set_xlim(0, 4)
+    ax.set_xticks([0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4], ["0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4+"])
     ax.set_xlabel("EGFR/CEP7 spots (cells with at least one CEP7 spot)")
-    ax.set_ylabel("share of cells (%)")
+    ax.set_ylabel("density of cells")
     ax.set_title(f"EGFR/CEP7: AUC = {auc['EGFR/CEP7 spots']:.3f}")
     ax.legend(frameon=False)
     out.append(("EGFR CEP7 spot ratio distribution malignant vs non-malignant", fig))
 
     fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)
     roc_colors = {"EGFR spots": EGFR_RED, "CEP7 spots": CEP7_GREEN, "EGFR/CEP7 spots": RATIO_COLOR,
-                  "EGFR/CEP7 intensity": "#e0a33a", "EGFR and CEP7 spot counts together": INK}
+                  "EGFR/CEP7 intensity": "#e0a33a"}
     for name, (x, y) in roc_inputs.items():
         cuts = np.unique(x)[::-1]
         tpr = [(x[y] >= t).mean() for t in cuts]
