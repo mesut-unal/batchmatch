@@ -221,8 +221,8 @@ def egfr_by_type_figure(cells: pd.DataFrame, order: list[str], normal_cep7: int)
 # --------------------------------------------------------------------------
 
 SPOT_MAX = 8
-MAL_COLOR, NON_COLOR = "#c0392b", "#2e7d5b"  # distribution curves: malignant vs non-malignant
-EGFR_RED, CEP7_GREEN, RATIO_COLOR = "#c0392b", "#2e7d5b", "#5b4b8a"  # ROC curves: one colour per FISH measure
+MAL_COLOR, NON_COLOR = "#c0392b", "#2c6fbb"  # distribution curves: malignant vs non-malignant
+EGFR_RED, CEP7_BLUE, RATIO_COLOR = "#c0392b", "#2c6fbb", "#5b4b8a"  # ROC curves: one colour per FISH measure
 
 
 def _features(cells: pd.DataFrame) -> dict[str, pd.Series]:
@@ -316,12 +316,36 @@ def distribution_figures(cells: pd.DataFrame, stats: pd.DataFrame, roc_inputs: d
     ax.set_xlim(0, 4)
     ax.set_xticks([0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4], ["0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4+"])
     ax.set_xlabel("EGFR/CEP7 spots (cells with at least one CEP7 spot)")
-    ax.set_ylabel("density of cells")
+    ax.set_ylabel("probability density")
     ax.set_title("EGFR/CEP7 spots: malignant vs non-malignant")
     ax.legend(frameon=False)
     out.append(("EGFR CEP7 spot ratio distribution malignant vs non-malignant", fig))
 
-    roc_colors = {"EGFR spots": EGFR_RED, "CEP7 spots": CEP7_GREEN, "EGFR/CEP7 spots": RATIO_COLOR,
+    # Same data as exact cell counts: one dot per exact ratio value, log y so both groups fit on one axis.
+    # Rare values (< 200 cells in both groups together) are left out and counted in the legend.
+    ratios = {label: (sub["egfr_spots_nuc"] / sub["cep7_spots_nuc"])[sub["cep7_spots_nuc"] > 0].clip(upper=4).round(3)
+              for sub, _, label in groups}
+    total = pd.concat(ratios.values()).value_counts()
+    values = sorted(total[total >= 200].index)
+    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    for sub, color, label in groups:
+        r = ratios[label]
+        counts = np.array([int((r == v).sum()) for v in values])
+        shown = counts > 0
+        ax.plot(np.array(values)[shown], counts[shown], "-o", color=color, lw=2, ms=6,
+                label=f"Xenium {label} (n={len(r):,}; {int((~r.isin(values)).sum()):,} at rare values not shown)")
+    ax.set_yscale("log")
+    ax.axvline(1, color="#7f8c8d", ls="--", lw=1.2)
+    ax.text(1.03, 0.97, "ratio = 1", color="#7f8c8d", va="top", transform=ax.get_xaxis_transform())
+    ax.set_xlim(-0.1, 4.1)
+    ax.set_xticks([0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4], ["0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4+"])
+    ax.set_xlabel("EGFR/CEP7 spots, exact value (cells with at least one CEP7 spot)")
+    ax.set_ylabel("number of cells (log scale)")
+    ax.set_title("EGFR/CEP7 spots: malignant vs non-malignant, cell counts")
+    ax.legend(frameon=False, loc="upper right")
+    out.append(("EGFR CEP7 spot ratio counts malignant vs non-malignant", fig))
+
+    roc_colors = {"EGFR spots": EGFR_RED, "CEP7 spots": CEP7_BLUE, "EGFR/CEP7 spots": RATIO_COLOR,
                   "EGFR/CEP7 intensity": "#e0a33a"}
     for keep, slug in ((None, "ROC malignant from FISH"), (("EGFR spots", "CEP7 spots"), "ROC malignant from FISH EGFR and CEP7 only")):
         fig, ax = plt.subplots(figsize=(8, 7), constrained_layout=True)

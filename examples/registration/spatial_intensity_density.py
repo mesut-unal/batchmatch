@@ -27,6 +27,20 @@ area in the bin. Agreement is ranked within each group separately.
 Outputs under ``<out>/plots``: ``intensity_density_*.png`` and
 ``intensity_density_stats.csv``.
 
+Which spatial plot is which (all under ``cells/plots``):
+
+    file prefix                 made by                         unit                                   outline from
+    cells_spatial_pattern_*     fish_to_xenium_cells.py         one dot per cell, raw values            Xenium cell centroids
+    cells_spatial_density_*     spatial_density.py              per-cell averages (FISH spots per       Xenium cells usable in FISH
+                                                                nucleus, EGFR/CEP7 spots, nuclear
+                                                                intensity, transcripts per cell)
+    cells_intensity_density_*   spatial_intensity_density.py    per tissue area (raw EGFR FISH pixel    FISH DAPI tissue mask
+                                                                signal, transcripts per 100 um^2)
+
+In both density families, ``_agreement_`` files compare one FISH map with that
+family's transcript map (same bins, same smoothing), and ``_malignant_`` /
+``_non_malignant_`` restrict it to those Xenium cell types.
+
 Run:
     uv run --no-sync python examples/registration/spatial_intensity_density.py \
         --cells-dir outputs/.../refine/cells \

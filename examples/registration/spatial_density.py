@@ -18,6 +18,20 @@ red (FISH) / green (transcripts) overlay where yellow means both are high.
 Outputs under ``<cells dir>/plots``: ``cells_spatial_density_*.png`` and
 ``spatial_density_stats.csv`` next to ``cells.csv``.
 
+Which spatial plot is which (all under ``cells/plots``):
+
+    file prefix                 made by                         unit                                   outline from
+    cells_spatial_pattern_*     fish_to_xenium_cells.py         one dot per cell, raw values            Xenium cell centroids
+    cells_spatial_density_*     spatial_density.py              per-cell averages (FISH spots per       Xenium cells usable in FISH
+                                                                nucleus, EGFR/CEP7 spots, nuclear
+                                                                intensity, transcripts per cell)
+    cells_intensity_density_*   spatial_intensity_density.py    per tissue area (raw EGFR FISH pixel    FISH DAPI tissue mask
+                                                                signal, transcripts per 100 um^2)
+
+In both density families, ``_agreement_`` files compare one FISH map with that
+family's transcript map (same bins, same smoothing), and ``_malignant_`` /
+``_non_malignant_`` restrict it to those Xenium cell types.
+
 Run:
     uv run --no-sync python examples/registration/spatial_density.py \
         --cells outputs/.../refine/cells/cells.csv \
